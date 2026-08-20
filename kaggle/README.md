@@ -7,7 +7,25 @@ reproducible from source rather than from someone's notebook history.
 |---|---|---|
 | `preflight.py` | CPU | verifies the dataset mount, HF token, gated model access, openslide and the GDC query before any quota is spent |
 | `extract_tpu.py` | TPU | streams all labelled slides from GDC, encodes with H-optimus-0, writes embeddings |
-| `train_tpu.py` | TPU VM (CPU) | cross-validated training, locked-set evaluation, release bundle |
+| `train_tpu.py` | TPU VM (CPU) | training only, when features already exist |
+| `pipeline_tpu.py` | TPU | **preferred**: extraction and training in one session |
+
+## Prefer the combined pipeline
+
+`pipeline_tpu.py` runs extraction and training back to back in a single
+session. With one concurrent TPU session allowed and roughly 20 minutes of
+queue per session, splitting the stages pays the queue tax twice and forces the
+embeddings through a publish-then-remount round trip that buys nothing. Both
+stages fit the session cap easily: extraction ~2 h, training minutes.
+
+It is safe to re-run. Extraction skips slides already present, and the training
+phase is guarded so a training bug prints a traceback, writes
+`TRAINING_FAILED.txt` and still exits 0 - the embeddings, which cost hours, are
+preserved as output either way. **A green run is not proof of success: check
+for `TRAINING_FAILED.txt`.**
+
+Output is flushed aggressively so `kaggle kernels logs <ref>` is useful while
+the run is still going, rather than only once it ends.
 
 ## Order matters: TPU concurrency is 1
 
