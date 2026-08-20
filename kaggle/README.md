@@ -25,7 +25,31 @@ preserved as output either way. **A green run is not proof of success: check
 for `TRAINING_FAILED.txt`.**
 
 Output is flushed aggressively so `kaggle kernels logs <ref>` is useful while
-the run is still going, rather than only once it ends.
+the run is still going, rather than only once it ends. Confirmed: logs stream
+with per-line timestamps during a RUNNING kernel, so a mistake an hour into
+extraction surfaces immediately.
+
+`watch.py` makes that practical - the raw command re-returns the entire log as
+JSON on every call, so it diffs against what it has already shown:
+
+```bash
+python kaggle/watch.py apexblue/pathgrade-pipeline
+python kaggle/watch.py apexblue/pathgrade-pipeline --grep "slides/h"
+```
+
+## Launch checklist
+
+An API push cannot attach secrets, so the first push is deliberately made with
+the accelerator set to CPU: the run starts immediately, fails in ~2 seconds at
+the token check, and burns no TPU queue. Then, in the UI:
+
+1. **Add-ons > Secrets** - tick `HF_TOKEN` (the secret is account-level; only
+   the attachment is per notebook)
+2. **Settings > Accelerator > TPU VM**
+3. **Save & Run All**
+
+Do not `kaggle kernels push` again afterwards - a new version can clear the
+attachment.
 
 ## Order matters: TPU concurrency is 1
 
