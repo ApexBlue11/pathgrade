@@ -41,6 +41,12 @@ class LossConfig:
     gamma: float = 0.1       # ACMIL branch diversity
     lambda_qwk: float = 0.2  # soft-QWK auxiliary
 
+    # Bag MixUp: swaps whole patches between slides (never interpolates
+    # features) and interpolates the ordinal target. Off by default; enable
+    # only if cross-validation says it helps.
+    mixup_prob: float = 0.0
+    mixup_alpha: float = 0.4
+
 
 @dataclass
 class OptimConfig:
@@ -70,6 +76,13 @@ class OptimConfig:
     plateau_window: int = 10
     plateau_slope: float | None = 0.001   # None disables trend-based stopping
     min_epochs: int = 20
+
+    # --- discriminative learning rates ----------------------------------
+    # All 1.0 collapses to a single param group, which is the default because
+    # there is no projection bottleneck left to balance against.
+    lr_mult_head: float = 1.0
+    lr_mult_scorer: float = 1.0
+    lr_mult_norm: float = 1.0
 
     # --- weight averaging -----------------------------------------------
     use_ema: bool = True

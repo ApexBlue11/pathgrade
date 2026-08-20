@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -258,3 +259,72 @@ def test_padded_batch_matches_unpadded_prefix():
     padded = torch.cat([real, real[-1:].expand(3, 3, 8, 8)], dim=0)
     with torch.no_grad():
         assert torch.allclose(net(real), net(padded)[:5], atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# encode_tiles ordering: parallel decode must not scramble features
+# --------------------------------------------------------------------------
+class _IndexEncoder:
+    """Encodes each tile to its own first-pixel value, so order is verifiable."""
+
+    class spec:
+        embed_dim = 4
+        name = "index"
+
+    is_xla = False
+
+    def __call__(self, batch):
+        import torch as t
+        vals = batch[:, 0, 0, 0].float()
+        return t.stack([vals] * 4, dim=1)
+
+
+class _FakeGrid:
+    def __init__(self, n):
+        self.coords = np.stack([np.arange(n), np.zeros(n, dtype=int)], axis=1)
+        self.level = 0
+        self.read_px = 4
+        self.out_px = 4
+        self.level0_px = 4
+        self.base_mpp = 0.5
+        self.scale_factor = 1.0
+
+
+@pytest.mark.parametrize("n,batch_size,workers", [(384, 64, 12), (100, 64, 8), (7, 4, 4), (1, 8, 2)])
+def test_encode_tiles_preserves_order(monkeypatch, n, batch_size, workers):
+    """Tile i must land at row i regardless of thread scheduling."""
+    import random as _random
+    from pathgrade.preprocessing import stream_extract as se
+
+    def fake_read_tile(slide, x, y, grid):
+        # Sleep jitter forces threads to complete out of submission order.
+        time.sleep(_random.random() * 0.001)
+        return np.full((4, 4, 3), x % 251, dtype=np.uint8)
+
+    monkeypatch.setattr(se, "read_tile", fake_read_tile)
+
+    grid = _FakeGrid(n)
+    feats = se.encode_tiles(
+        object(), grid, _IndexEncoder(), lambda t: t,
+        batch_size=batch_size, num_workers=workers, queue_depth=3,
+    )
+    assert feats.shape == (n, 4)
+    expected = np.array([i % 251 for i in range(n)], dtype=np.float32)
+    assert np.array_equal(feats[:, 0], expected), "features misaligned with tile order"
+
+
+def test_encode_tiles_handles_ragged_final_batch(monkeypatch):
+    """Padding the last short batch must not leak padded rows into the output."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), x % 251, dtype=np.uint8),
+    )
+    n = 130                                     # 2 full batches of 64 + 2 leftover
+    feats = se.encode_tiles(
+        object(), _FakeGrid(n), _IndexEncoder(), lambda t: t,
+        batch_size=64, num_workers=4, queue_depth=2,
+    )
+    assert feats.shape == (n, 4)
+    assert np.array_equal(feats[:, 0], np.arange(n, dtype=np.float32) % 251)

@@ -25,16 +25,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from ..encoders import DEFAULT_ENCODER, PatchEncoder, check_licence, describe_registry, resolve_device
+from ..progress import ProgressReporter
 from .gdc import SlideRecord, download_slide, free_disk_gb, one_slide_per_patient, query_slides, shard, summarise
 from .tiling import build_grid, read_tile
 
@@ -107,37 +111,77 @@ class SlidePrefetcher:
 
 
 @torch.inference_mode()
-def encode_tiles(slide, grid, encoder: PatchEncoder, transform, batch_size: int) -> np.ndarray:
-    """Encode every tile in ``grid``, padding batches to a constant size for XLA."""
-    coords = grid.coords
-    out = np.empty((len(coords), encoder.spec.embed_dim), dtype=np.float32)
-    buf: list[torch.Tensor] = []
-    written = 0
+def encode_tiles(
+    slide,
+    grid,
+    encoder: PatchEncoder,
+    transform,
+    batch_size: int,
+    num_workers: int = 8,
+    queue_depth: int = 3,
+) -> np.ndarray:
+    """Encode every tile in ``grid``, decoding tiles on a thread pool.
 
-    def flush():
-        nonlocal written, buf
-        if not buf:
-            return
-        real = len(buf)
-        batch = torch.stack(buf)
+    Tile decoding, not the accelerator, is the usual bottleneck: a serial
+    ``read_region`` + resize runs around 100 tiles/s, which would leave a TPU
+    idle roughly 95% of the time. Threads (not processes) are the right tool
+    here because OpenSlide releases the GIL inside ``read_region`` and Pillow
+    releases it during resize, so they genuinely run in parallel - and an
+    OpenSlide handle is documented as safe for concurrent reads, so all workers
+    can share one open slide with no per-worker reopen cost.
+
+    Batches are submitted ``queue_depth`` ahead so decoding for batch n+1
+    overlaps the forward pass for batch n.
+    """
+    coords = grid.coords
+    n = len(coords)
+    out = np.empty((n, encoder.spec.embed_dim), dtype=np.float32)
+
+    def decode_one(i: int) -> np.ndarray:
+        return transform(read_tile(slide, int(coords[i][0]), int(coords[i][1]), grid))
+
+    def encode(start: int, tiles: list[np.ndarray]) -> None:
+        # Stack as uint8 and let the accelerator normalise; float math in the
+        # decode threads competes for the cores that are already the limit.
+        batch = torch.from_numpy(np.stack(tiles))
+        real = batch.shape[0]
         if real < batch_size:
-            pad = batch[-1:].expand(batch_size - real, *batch.shape[1:])
-            batch = torch.cat([batch, pad], dim=0)
+            # Constant shape for XLA: pad by repeating, then slice the result.
+            batch = torch.cat([batch, batch[-1:].expand(batch_size - real, *batch.shape[1:])])
         feats = encoder(batch)
         if encoder.is_xla:
             import torch_xla.core.xla_model as xm
 
             xm.mark_step()
-        out[written : written + real] = feats[:real].cpu().numpy()
-        written += real
-        buf = []
+        out[start : start + real] = feats[:real].cpu().numpy()
 
-    for i in range(len(coords)):
-        x, y = coords[i]
-        buf.append(transform(read_tile(slide, int(x), int(y), grid)))
-        if len(buf) == batch_size:
-            flush()
-    flush()
+    # Parallelism must be at the *tile* level. Submitting one task per batch and
+    # decoding its tiles serially caps concurrency at the queue depth no matter
+    # how many workers exist - measured 106 tiles/s that way versus 371 with
+    # per-tile tasks on the same box.
+    max_inflight = max(batch_size * max(1, queue_depth), batch_size)
+    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as pool:
+        pending: deque = deque()
+        buffered: list[np.ndarray] = []
+        start = 0
+
+        def drain_one():
+            nonlocal start, buffered
+            buffered.append(pending.popleft().result())
+            if len(buffered) == batch_size:
+                encode(start, buffered)
+                start += batch_size
+                buffered = []
+
+        for i in range(n):
+            pending.append(pool.submit(decode_one, i))
+            if len(pending) >= max_inflight:
+                drain_one()
+        while pending:
+            drain_one()
+        if buffered:
+            encode(start, buffered)
+
     return out
 
 
@@ -165,7 +209,10 @@ def process_slide(
             raise ValueError("no tissue tiles found")
 
         t0 = time.time()
-        feats = encode_tiles(slide, grid, encoder, transform, args.batch_size)
+        feats = encode_tiles(
+            slide, grid, encoder, transform, args.batch_size,
+            num_workers=args.decode_workers, queue_depth=args.queue_depth,
+        )
         elapsed = time.time() - t0
     finally:
         slide.close()
@@ -229,12 +276,37 @@ def run(args) -> int:
 
     device = resolve_device(args.device)
     print(f"device: {device}  |  encoder {spec.name} ({spec.embed_dim}-d, {spec.licence})")
-    print(f"free disk: {free_disk_gb(cache_dir):.1f} GB\n")
+    print(f"decode workers: {args.decode_workers}  |  batch {args.batch_size}")
+
+    # Kaggle gives ~20 GB on /kaggle/working (persisted, becomes the dataset) and
+    # ~60 GB on /kaggle/tmp (scratch). Slides must land on scratch or the output
+    # volume fills after a handful of them.
+    out_free, cache_free = free_disk_gb(out_dir), free_disk_gb(cache_dir)
+    per_slide_mb = args.max_patches * spec.embed_dim * (4 if args.fp32_store else 2) / 1e6
+    projected_gb = per_slide_mb * len(todo) / 1000
+    print(f"free disk: output {out_free:.1f} GB, cache {cache_free:.1f} GB")
+    print(f"projected output: {projected_gb:.1f} GB ({per_slide_mb:.1f} MB/slide x {len(todo)})")
+
+    if str(out_dir.resolve()) == str(cache_dir.resolve()):
+        print("!! cache-dir equals out-dir; slides will compete with embeddings for space",
+              file=sys.stderr)
+    if projected_gb > out_free - args.min_free_gb:
+        print(
+            f"!! projected output ({projected_gb:.1f} GB) may not fit in {out_free:.1f} GB. "
+            f"Lower --max-patches, raise --num-shards, or write to a bigger volume.",
+            file=sys.stderr,
+        )
+    print()
 
     encoder = PatchEncoder(spec, device=device)
     transform = encoder.build_transform()
 
     journal_path = out_dir / f"journal_shard{args.shard}.jsonl"
+    reporter = ProgressReporter(
+        out_dir, total=len(todo), shard=args.shard, label="extract",
+        webhook_url=args.webhook_url, notify_every=args.notify_every,
+    )
+    reporter.notify(f"START shard {args.shard}: {len(todo)} slides on {device}")
     prefetcher = SlidePrefetcher(todo, cache_dir, depth=args.prefetch).start()
 
     done, failed, patches = 0, 0, 0
@@ -245,6 +317,15 @@ def run(args) -> int:
         for record, slide_path, info in prefetcher:
             if deadline and time.time() > deadline:
                 print(f"\nreached --max-hours ({args.max_hours}h); stopping cleanly.")
+                break
+            remaining = free_disk_gb(out_dir)
+            if remaining < args.min_free_gb:
+                print(
+                    f"\nonly {remaining:.1f} GB left on the output volume "
+                    f"(--min-free-gb {args.min_free_gb}); stopping cleanly so the "
+                    f"finished embeddings survive.",
+                    file=sys.stderr,
+                )
                 break
             if slide_path is None:
                 failed += 1
@@ -270,12 +351,14 @@ def run(args) -> int:
             except Exception as e:
                 failed += 1
                 print(f"  {record.patient_id}: EXTRACT FAILED - {e}", file=sys.stderr)
+                reporter.update(False, extra={"last_error": f"{record.patient_id}: {e}"})
             finally:
                 # The whole point: reclaim the disk immediately.
                 if not args.keep_slides:
                     Path(slide_path).unlink(missing_ok=True)
     finally:
         prefetcher.stop()
+        reporter.finish(f"{patches:,} patches")
 
     hours = (time.time() - t_start) / 3600
     print(f"\n{done} slides, {patches:,} patches, {failed} failures in {hours:.2f} h")
@@ -310,6 +393,11 @@ def build_parser():
     p.add_argument("--batch-size", type=int, default=64,
                    help="keep constant on TPU; it defines the compiled graph")
     p.add_argument("--prefetch", type=int, default=1, help="slides to fetch ahead")
+    p.add_argument("--decode-workers", type=int, default=max(4, (os.cpu_count() or 8)),
+                   help="threads decoding tiles. This, not the accelerator, is usually the limit")
+    p.add_argument("--queue-depth", type=int, default=3, help="tile batches decoded ahead")
+    p.add_argument("--min-free-gb", type=float, default=3.0,
+                   help="stop cleanly when the output volume drops below this")
 
     p.add_argument("--one-per-patient", action="store_true", default=True)
     p.add_argument("--all-slides", dest="one_per_patient", action="store_false")
@@ -319,6 +407,9 @@ def build_parser():
     p.add_argument("--assume-mpp", type=float, default=None)
     p.add_argument("--fp32-store", action="store_true")
     p.add_argument("--allow-noncommercial", action="store_true")
+    p.add_argument("--webhook-url", default=None,
+                   help="Discord/Slack/Telegram hook for phone notifications")
+    p.add_argument("--notify-every", type=int, default=25, help="slides between pings")
     return p
 
 

@@ -54,6 +54,20 @@ def corn_cumulative_probs(logits: torch.Tensor) -> torch.Tensor:
     return torch.cumprod(torch.sigmoid(logits), dim=1)
 
 
+def corn_loss_soft(logits: torch.Tensor, cum_targets: torch.Tensor) -> torch.Tensor:
+    """CORN with soft cumulative targets, for MixUp-style interpolated labels.
+
+    Standard CORN trains each task on the conditional subset {y > j-1}, which
+    needs a hard label to define membership. A mixed bag has no hard grade, so
+    the loss instead applies binary cross-entropy directly to the *unconditional*
+    cumulative probabilities P(y > j). Rank consistency is unaffected: it comes
+    from the cumprod parameterisation, not from the loss.
+    """
+    cum = corn_cumulative_probs(logits).clamp(1e-6, 1 - 1e-6)
+    bce = -(cum_targets * cum.log() + (1.0 - cum_targets) * (1.0 - cum).log())
+    return bce.mean()
+
+
 def corn_class_probs(logits: torch.Tensor) -> torch.Tensor:
     """Convert CORN logits to a proper [B, n_classes] distribution."""
     cum = corn_cumulative_probs(logits)                       # [B, K-1]
@@ -112,11 +126,24 @@ class ASMILOrdLoss(nn.Module):
         self.gamma = gamma
         self.lambda_qwk = lambda_qwk
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, aux: dict | None = None):
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        aux: dict | None = None,
+        cum_targets: torch.Tensor | None = None,
+    ):
+        """``cum_targets`` overrides ``targets`` when the batch has been mixed."""
         aux = aux or {}
-        parts = {"corn": corn_loss(logits, targets, self.n_classes)}
+        mixed = cum_targets is not None
+        parts = {
+            "corn": corn_loss_soft(logits, cum_targets) if mixed
+            else corn_loss(logits, targets, self.n_classes)
+        }
 
-        if self.lambda_qwk > 0:
+        # The soft-QWK relaxation needs hard class labels to build its confusion
+        # matrix, so it sits out on mixed batches rather than being approximated.
+        if self.lambda_qwk > 0 and not mixed:
             parts["qwk"] = self.lambda_qwk * soft_qwk_loss(
                 corn_class_probs(logits), targets, self.n_classes
             )

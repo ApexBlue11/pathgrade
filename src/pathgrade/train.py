@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from .augment import bag_mixup
 from .callbacks import EarlyStopping, WeightEMA, suggest_ema_decay
 from .config import Config
 from .data.dataset import (
@@ -25,6 +26,7 @@ from .data.dataset import (
     feature_dim,
     suggest_bag_size,
 )
+from .data.io import find_feature_file, verify_cohort
 from .data.splits import load_splits
 from .encoders import check_licence
 from .losses import ASMILOrdLoss, corn_cumulative_probs
@@ -39,6 +41,43 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def build_param_groups(model, cfg: Config) -> list[dict]:
+    """Discriminative learning rates by module role.
+
+    v1 used four LR tiers, largely to nurse its 1024->256 projection layer. With
+    no projection there is far less to balance, so the multipliers default to
+    1.0 and this collapses to a single group. They are exposed because the
+    classifier head sits on a differently-scaled input than the attention
+    scorer, and on a small cohort that can matter - but it should be turned on
+    by CV evidence, not by default.
+    """
+    m = cfg.optim
+    buckets: dict[str, list] = {"head": [], "scorer": [], "norm": [], "other": []}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("head"):
+            buckets["head"].append(param)
+        elif name.startswith("online"):
+            buckets["scorer"].append(param)
+        elif name.startswith("norm"):
+            buckets["norm"].append(param)
+        else:
+            buckets["other"].append(param)
+
+    mult = {
+        "head": m.lr_mult_head,
+        "scorer": m.lr_mult_scorer,
+        "norm": m.lr_mult_norm,
+        "other": 1.0,
+    }
+    return [
+        {"params": params, "lr": m.lr * mult[key], "name": key}
+        for key, params in buckets.items()
+        if params
+    ]
 
 
 def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
@@ -88,7 +127,8 @@ def predict_slide_full(model, path, bag_size: int, device, n_offsets: int | None
 
 def evaluate_full(model, ids, labels, feature_dir, bag_size, device, n_classes=3, bootstrap=0):
     cums = torch.stack([
-        predict_slide_full(model, Path(feature_dir) / f"{pid}.h5", bag_size, device) for pid in ids
+        predict_slide_full(model, find_feature_file(feature_dir, pid), bag_size, device)
+        for pid in ids
     ])
     preds = (cums > 0.5).sum(dim=1).numpy()
     truth = np.array([labels[pid] for pid in ids])
@@ -125,9 +165,10 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
     ).to(device)
 
     criterion = ASMILOrdLoss(d.n_classes, cfg.loss.beta, cfg.loss.gamma, cfg.loss.lambda_qwk)
+    # LambdaLR scales each group's own base_lr, so per-group multipliers survive
+    # the warmup + cosine schedule.
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay,
+        build_param_groups(model, cfg), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
     )
     scheduler = build_scheduler(optimizer, cfg, max(1, len(train_loader)))
     use_amp = cfg.optim.amp and device.type == "cuda"
@@ -163,10 +204,17 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
             m = batch["mask"].to(device, non_blocking=True)
             y = batch["label"].to(device, non_blocking=True)
 
+            cum_targets = None
+            if cfg.loss.mixup_prob > 0:
+                x, m, cum_targets = bag_mixup(
+                    x, m, y, d.n_classes,
+                    alpha=cfg.loss.mixup_alpha, prob=cfg.loss.mixup_prob,
+                )
+
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
                 out = model(x, m)
-                loss, parts = criterion(out.logits, y, out.aux)
+                loss, parts = criterion(out.logits, y, out.aux, cum_targets=cum_targets)
 
             scaler.scale(loss).backward()
             if cfg.optim.grad_clip:

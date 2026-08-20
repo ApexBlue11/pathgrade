@@ -8,6 +8,7 @@ rates off the log, and re-run this with the measured values.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -38,10 +39,17 @@ def main():
     p.add_argument("--encoder", default="h-optimus-0")
     p.add_argument("--max-patches", type=int, default=4000)
     p.add_argument("--download-mbps", type=float, default=50.0, help="measured MB/s from GDC")
-    p.add_argument("--decode-tiles-per-sec", type=float, default=1200.0, help="openslide+resize, all workers")
+    p.add_argument("--decode-tiles-per-sec", type=float, default=None,
+                   help="measured tile decode rate. Default scales a measured "
+                        "27 tiles/s/vCPU by this machine's core count")
     p.add_argument("--num-shards", type=int, default=4)
     p.add_argument("--all-slides", action="store_true", help="every slide, not one per patient")
     args = p.parse_args()
+
+    # Measured on a 12-vCPU box at 0.5 um/px with 224px output: 329 tiles/s
+    # with tile-level threading. Roughly linear in cores until disk-bound.
+    if args.decode_tiles_per_sec is None:
+        args.decode_tiles_per_sec = 27.0 * (os.cpu_count() or 8)
 
     spec = get_spec(args.encoder)
     records = query_slides(args.project, diagnostic_only=True)
@@ -64,7 +72,8 @@ def main():
 
     print(f"{'stage':<22}{'cost':>12}   note")
     print("-" * 74)
-    print(f"{'download':<22}{fmt_hours(dl_h):>12}   {total_gb:.0f} GB at {args.download_mbps:.0f} MB/s")
+    print(f"{'download':<22}{fmt_hours(dl_h):>12}   {total_gb:.0f} GB at {args.download_mbps:.0f} MB/s"
+          f"  <- MEASURE THIS")
     print(f"{'tile decode (CPU)':<22}{fmt_hours(decode_h):>12}   {args.decode_tiles_per_sec:.0f} tiles/s")
     print(f"{'output storage':<22}{store_gb:>10.1f} GB   fp16 embeddings\n")
 

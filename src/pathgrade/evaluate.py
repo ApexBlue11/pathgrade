@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from .config import Config
+from .data.io import find_feature_file
 from .data.splits import load_splits
 from .metrics import compute_metrics, contextualise, format_confusion
 from .models.asmil_ord import ASMILOrd
@@ -53,7 +54,7 @@ def ensemble_predict(models, ids, feature_dir, bag_size, device):
     """Returns cumulative probs [N, K-1] and per-slide disagreement across folds."""
     all_cums, spreads = [], []
     for pid in ids:
-        path = Path(feature_dir) / f"{pid}.h5"
+        path = find_feature_file(feature_dir, pid)
         per_model = torch.stack([
             predict_slide_full(m, path, bag_size, device) for m in models
         ])                                                    # [M, K-1]
