@@ -156,10 +156,33 @@ def check_licence(name: str, allow_noncommercial: bool = False) -> EncoderSpec:
     return spec
 
 
-class PatchEncoder(nn.Module):
-    """Wraps a timm backbone and applies the spec's pooling rule."""
+def resolve_device(device: str = "auto") -> torch.device:
+    """Pick an accelerator, including TPU when torch_xla is importable."""
+    if device != "auto":
+        if device == "xla":
+            import torch_xla.core.xla_model as xm
 
-    def __init__(self, spec: EncoderSpec, device: str = "cuda", dtype: torch.dtype = torch.float16):
+            return xm.xla_device()
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    try:
+        import torch_xla.core.xla_model as xm
+
+        return xm.xla_device()
+    except ImportError:
+        return torch.device("cpu")
+
+
+class PatchEncoder(nn.Module):
+    """Wraps a timm backbone and applies the spec's pooling rule.
+
+    Works on CUDA, TPU (torch_xla) and CPU. On TPU the weights are cast to
+    bfloat16 up front rather than relying on autocast: XLA compiles a static
+    graph, and keeping the dtype fixed avoids a second compilation.
+    """
+
+    def __init__(self, spec: EncoderSpec, device: str | torch.device = "auto", dtype=None):
         super().__init__()
         try:
             import timm
@@ -167,28 +190,43 @@ class PatchEncoder(nn.Module):
             raise ImportError("Feature extraction needs `timm`: pip install timm") from e
 
         self.spec = spec
-        self.device = device
+        self.device = resolve_device(device) if isinstance(device, str) else device
+        self.device_type = self.device.type
+        self.is_xla = self.device_type == "xla"
+
+        if dtype is None:
+            dtype = {"cuda": torch.float16, "xla": torch.bfloat16}.get(self.device_type, torch.float32)
         self.dtype = dtype
+
         self.backbone = timm.create_model(
             spec.hf_hub_id, pretrained=True, num_classes=0, **spec.timm_kwargs
         )
-        self.backbone.eval().to(device)
+        self.backbone.eval().to(self.device)
+        if self.is_xla:
+            self.backbone.to(self.dtype)
 
     @torch.inference_mode()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, 3, H, W] -> [B, embed_dim]."""
-        x = x.to(self.device, non_blocking=True)
-        with torch.autocast(device_type=self.device.split(":")[0], dtype=self.dtype):
-            if self.spec.pooling == "cls":
-                out = self.backbone(x)
-                if out.ndim == 3:                      # some backbones return tokens
-                    out = out[:, 0]
-            else:
-                tokens = self.backbone.forward_features(x)     # [B, 1 + P(+R), C]
-                n_prefix = getattr(self.backbone, "num_prefix_tokens", 1)
-                cls, patches = tokens[:, 0], tokens[:, n_prefix:]
-                out = torch.cat([cls, patches.mean(dim=1)], dim=-1)
+        """[B, 3, H, W] -> [B, embed_dim]. Batch size must be constant on TPU."""
+        x = x.to(self.device, non_blocking=not self.is_xla)
+        if self.is_xla:
+            out = self._forward_inner(x.to(self.dtype))
+        else:
+            with torch.autocast(device_type=self.device_type, dtype=self.dtype,
+                                enabled=self.device_type == "cuda"):
+                out = self._forward_inner(x)
         return out.float()
+
+    def _forward_inner(self, x: torch.Tensor) -> torch.Tensor:
+        if self.spec.pooling == "cls":
+            out = self.backbone(x)
+            if out.ndim == 3:                          # some backbones return tokens
+                out = out[:, 0]
+            return out
+        tokens = self.backbone.forward_features(x)     # [B, 1 + P(+R), C]
+        n_prefix = getattr(self.backbone, "num_prefix_tokens", 1)
+        cls, patches = tokens[:, 0], tokens[:, n_prefix:]
+        return torch.cat([cls, patches.mean(dim=1)], dim=-1)
 
     def build_transform(self):
         from torchvision import transforms

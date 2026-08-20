@@ -41,8 +41,23 @@ optim:
   warmup_epochs: 5
   batch_size: 8
   grad_clip: 1.0
-  patience: 20
   num_workers: 4
   amp: true
   balanced_sampling: true   # preferred over loss weighting; keeps the loss a clean likelihood
   eval_offsets: 6           # subspaces per epoch-validation (all 24 used for final scoring)
+
+  # Early stopping. QWK on an ~80-slide fold shifts ~0.02 when one slide flips,
+  # so the metric is median-smoothed before the patience counter sees it and a
+  # gain must clear min_delta. Training also stops on a flat trend, not just on
+  # exhausted patience.
+  patience: 20
+  min_delta: 0.002
+  smooth_window: 5
+  plateau_window: 10
+  plateau_slope: 0.001      # null disables trend-based stopping
+  min_epochs: 20
+
+  # Weight averaging. Evaluated against the best-epoch weights per fold and
+  # used only if it actually wins.
+  use_ema: true
+  ema_span_fraction: 0.25

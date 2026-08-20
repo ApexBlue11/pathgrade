@@ -55,11 +55,25 @@ class OptimConfig:
     warmup_epochs: int = 5
     batch_size: int = 8
     grad_clip: float = 1.0
-    patience: int = 20
     num_workers: int = 4
     amp: bool = True
     balanced_sampling: bool = True
     eval_offsets: int = 6    # subspaces used for per-epoch validation
+
+    # --- early stopping -------------------------------------------------
+    # QWK on an ~80-slide fold moves about 0.02 when a single slide flips, so
+    # min_delta sits just above that noise floor and the metric is median-
+    # smoothed before the patience counter looks at it.
+    patience: int = 20
+    min_delta: float = 0.002
+    smooth_window: int = 5
+    plateau_window: int = 10
+    plateau_slope: float | None = 0.001   # None disables trend-based stopping
+    min_epochs: int = 20
+
+    # --- weight averaging -----------------------------------------------
+    use_ema: bool = True
+    ema_span_fraction: float = 0.25       # EMA window as a fraction of total steps
 
 
 @dataclass

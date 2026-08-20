@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from .callbacks import EarlyStopping, WeightEMA, suggest_ema_decay
 from .config import Config
 from .data.dataset import (
     SlideBagDataset,
@@ -132,8 +133,27 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
     use_amp = cfg.optim.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    total_steps = max(1, len(train_loader)) * cfg.optim.epochs
+    ema = None
+    if cfg.optim.use_ema:
+        ema = WeightEMA(
+            model,
+            decay=suggest_ema_decay(total_steps, cfg.optim.ema_span_fraction),
+            start_step=max(1, len(train_loader)) * cfg.optim.warmup_epochs,
+        )
+
+    stopper = EarlyStopping(
+        patience=cfg.optim.patience,
+        min_delta=cfg.optim.min_delta,
+        mode="max",
+        smooth_window=cfg.optim.smooth_window,
+        plateau_window=cfg.optim.plateau_window,
+        plateau_slope=cfg.optim.plateau_slope,
+        min_epochs=cfg.optim.min_epochs,
+    )
+
     best = {"qwk": -2.0, "epoch": -1, "state": None}
-    history, no_improve = [], 0
+    history, stop_reason = [], "completed all epochs"
 
     for epoch in range(1, cfg.optim.epochs + 1):
         model.train()
@@ -156,6 +176,8 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
             scaler.update()
             scheduler.step()
             model.update_anchor()          # EMA anchor tracks the online scorer
+            if ema is not None:
+                ema.update(model)
 
             epoch_loss += float(loss.detach())
             for k, v in parts.items():
@@ -167,52 +189,70 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
         preds = (cums > 0.5).sum(dim=1).numpy()
         m_val = compute_metrics(ys.numpy(), preds, d.n_classes)
 
-        history.append({
-            "epoch": epoch,
-            "loss": epoch_loss / n_batches,
-            "parts": {k: v / n_batches for k, v in parts_acc.items()},
-            "val_qwk": m_val.qwk,
-            "val_macro_f1": m_val.macro_f1,
-            "lr": scheduler.get_last_lr()[0],
-        })
-
-        improved = m_val.qwk > best["qwk"] + 1e-5
-        if improved:
+        decision = stopper.step(m_val.qwk, epoch)
+        if decision.improved:
             best = {
                 "qwk": m_val.qwk,
                 "epoch": epoch,
                 "state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
             }
-            no_improve = 0
-        else:
-            no_improve += 1
+
+        history.append({
+            "epoch": epoch,
+            "loss": epoch_loss / n_batches,
+            "parts": {k: v / n_batches for k, v in parts_acc.items()},
+            "val_qwk": m_val.qwk,
+            "val_qwk_smoothed": decision.smoothed,
+            "val_macro_f1": m_val.macro_f1,
+            "trend_slope": decision.slope,
+            "lr": scheduler.get_last_lr()[0],
+        })
 
         print(
             f"  fold {fold} ep {epoch:03d}/{cfg.optim.epochs} "
-            f"loss {epoch_loss / n_batches:.4f} | val QWK {m_val.qwk:.4f} "
-            f"F1 {m_val.macro_f1:.4f} | best {best['qwk']:.4f} @{best['epoch']} "
-            f"| patience {cfg.optim.patience - no_improve}"
+            f"loss {epoch_loss / n_batches:.4f} | QWK {m_val.qwk:.4f} "
+            f"(smooth {decision.smoothed:.4f}) F1 {m_val.macro_f1:.4f} | {stopper.status()}"
         )
 
-        if no_improve >= cfg.optim.patience:
-            print(f"  fold {fold}: early stop at epoch {epoch}")
+        if decision.stop:
+            stop_reason = decision.reason
+            print(f"  fold {fold}: early stop at epoch {epoch} - {stop_reason}")
             break
 
+    # Best-epoch weights vs. the EMA average: pick the winner on this fold
+    # rather than assuming either is better.
     model.load_state_dict(best["state"])
     m_final, cums, preds, truth = evaluate_full(
         model, val_ids, labels, d.feature_dir, d.bag_size, device, d.n_classes
     )
+    selected, final_state = "best-epoch", best["state"]
+
+    if ema is not None:
+        ema_state = ema.state_dict()
+        model.load_state_dict(ema_state)
+        m_ema, cums_ema, preds_ema, truth_ema = evaluate_full(
+            model, val_ids, labels, d.feature_dir, d.bag_size, device, d.n_classes
+        )
+        print(f"  fold {fold} weight selection: best-epoch {m_final.qwk:.4f} vs EMA {m_ema.qwk:.4f}")
+        if m_ema.qwk > m_final.qwk:
+            m_final, cums, preds, truth = m_ema, cums_ema, preds_ema, truth_ema
+            selected, final_state = "ema", ema_state
+        else:
+            model.load_state_dict(best["state"])
 
     fold_dir = cfg.run_dir / f"fold{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "state_dict": best["state"],
+            "state_dict": final_state,
             "config": cfg.to_dict(),
             "fold": fold,
+            "weights_selected": selected,
             "val_qwk_subbag": best["qwk"],
             "val_qwk_full": m_final.qwk,
             "epoch": best["epoch"],
+            "stop_reason": stop_reason,
+            "epochs_run": len(history),
         },
         fold_dir / "checkpoint.pt",
     )
@@ -223,7 +263,14 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
         patient_ids=np.array(val_ids), cumulative=cums, pred=preds, true=truth,
     )
 
-    return {"fold": fold, "best_epoch": best["epoch"], "history": history}, m_final
+    return {
+        "fold": fold,
+        "best_epoch": best["epoch"],
+        "epochs_run": len(history),
+        "stop_reason": stop_reason,
+        "weights_selected": selected,
+        "history": history,
+    }, m_final
 
 
 def run_cv(cfg: Config) -> dict:
@@ -258,8 +305,15 @@ def run_cv(cfg: Config) -> dict:
     summary["bag_size"] = cfg.data.bag_size
     summary["feature_dim"] = cfg.model.feature_dim
     summary["folds"] = [
-        {"fold": i, "best_epoch": lg["best_epoch"], **{k: getattr(m, k) for k in
-         ("qwk", "macro_f1", "balanced_accuracy", "adjacent_accuracy", "mean_absolute_error")}}
+        {
+            "fold": i,
+            "best_epoch": lg["best_epoch"],
+            "epochs_run": lg["epochs_run"],
+            "stop_reason": lg["stop_reason"],
+            "weights_selected": lg["weights_selected"],
+            **{k: getattr(m, k) for k in
+               ("qwk", "macro_f1", "balanced_accuracy", "adjacent_accuracy", "mean_absolute_error")},
+        }
         for i, (lg, m) in enumerate(zip(fold_logs, fold_metrics))
     ]
 

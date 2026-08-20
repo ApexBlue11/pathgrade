@@ -80,6 +80,29 @@ weighted pool over full 1536-d  ->  MLP  ->  2 CORN logits  ->  P(y>G1), P(y>G2)
 - **Fixed-size sub-bags.** Makes bags stackable, so batch size > 1 and
   class-balanced sampling both become available.
 
+### Carried over from v1, and what was reconsidered
+
+The v1 HPO notebook recorded a genuine list of hard-won fixes. Kept: warmup +
+cosine decay, gradient clipping at global norm 1.0, `hidden_dim` 256, and the
+underlying lesson behind Pre-LN — training instability was the real enemy,
+though it is now addressed more directly by the ASMIL anchor.
+
+Two were reconsidered:
+
+- **SWA was dropped for the wrong reason.** The stated cause was an
+  implementation bug ("fixed denominator + best epochs appear before SWA
+  window"), not evidence that weight averaging hurts. It is back as
+  `WeightEMA` — but the averaged weights are *evaluated against* the best-epoch
+  weights on each fold and used only if they win, rather than assumed better.
+- **Layer-wise learning rates were dropped.** v1 needed four LR tiers largely
+  to nurse the `proj` bottleneck. With no projection layer there is much less to
+  balance, so a single AdamW group is used until there is evidence otherwise.
+
+MixUp stays out. v1 called it "biologically unsound for WSI feature space",
+which is a reasonable prior, though feature-space mixing does have supporters in
+recent MIL work. The sub-bag resampling already supplies strong augmentation, so
+there is no need to relitigate it now.
+
 **Encoder choice matters more than any of this.** The Frontiers 2026
 practical-guidelines study found aggregator choice is largely secondary to
 embedding quality. The move off a weaker encoder is the single biggest lever;
@@ -93,15 +116,52 @@ everything above is the second-order gain.
 pip install -r requirements.txt
 ```
 
-**1. Extract embeddings** — the only GPU-expensive stage.
+**0. Plan the budget** — queries GDC live, before you spend any quota.
 
 ```bash
-python scripts/01_extract_features.py --slide-dir data/wsi --out-dir data/features/h-optimus-0 --encoder h-optimus-0
+python scripts/00_plan_budget.py --max-patches 4000 --download-mbps 50
 ```
 
-Writes one HDF5 per slide: `features [N, 1536]`, `coords [N, 2]`, plus a
-provenance block (encoder, licence, MPP, tiling settings) in the file attributes.
-Resumable — already-extracted slides are skipped.
+TCGA-HNSC is **472 diagnostic slides / 450 patients / 456 GB** (424 GB at one
+slide per patient). That download dominates everything: on a TPU v5e-8 the
+encode is ~29 min against ~2.4 h of transfer, so the job is **network-bound, not
+compute-bound**. The planner prints how far you can raise `--max-patches` before
+compute overtakes download — on v5e-8 that is ~10,000 patches/slide *for free*.
+
+**1. Extract embeddings** — the only accelerator-expensive stage.
+
+*Streaming (no local slides needed):* fetch, encode, delete, repeat. At most two
+slides ever touch disk.
+
+```bash
+python scripts/01b_stream_extract.py --out-dir data/features/h-optimus-0 --device xla --max-patches 8000 --shard 0 --num-shards 4 --max-hours 8
+```
+
+*From local slides:*
+
+```bash
+python scripts/01_extract_features.py --slide-dir data/wsi --out-dir data/features/h-optimus-0
+```
+
+Writes one file per patient — `.h5` by default, `--format pt` for the older
+Kaggle layout — holding `features [N, 1536]`, `coords [N, 2]`, and a provenance
+block (encoder, licence, MPP, tiling). Both are resumable; already-extracted
+slides are skipped, and a journal lets a killed session resume mid-shard.
+
+### Running on Kaggle TPU
+
+PyTorch runs on TPU via `torch_xla`; pass `--device xla`. Two details matter:
+
+- **XLA compiles one graph per input shape.** A ragged final batch would
+  recompile on every slide, so batches are padded to a constant size and sliced
+  after. Keep `--batch-size` fixed.
+- **Sharding doubles as core assignment.** `--shard i --num-shards n` splits
+  slides across parallel sessions; the same flag assigns work per core under
+  `xmp.spawn`.
+
+Since the job is download-bound, TPU buys roughly 2.7 h versus 6.1 h on 2×T4 —
+real, but not decisive. The bigger win is running TPU *and* GPU sessions
+concurrently on different shards, which uses two separate Kaggle quotas at once.
 
 **2. Build splits** — patient-level, with a locked test set.
 
@@ -143,6 +203,24 @@ This repo enforces the alternative in code:
 - **Bootstrap confidence intervals** on QWK. On a few hundred slides the spread
   is roughly ±0.1; three decimal places without an interval implies a precision
   the cohort cannot support.
+
+### Early stopping
+
+v1 reset its patience counter on raw `val_qwk > best_qwk`. On an ~80-slide fold
+a single slide changing grade moves QWK by about 0.02, so noise alone
+manufactures "improvements" that keep a dead run alive. `EarlyStopping` instead:
+
+- compares a **running median** of the metric, so one lucky epoch cannot grant a
+  reprieve (there is a regression test for exactly this);
+- requires gains to clear **`min_delta`**, set just above that noise floor;
+- stops on a **flat trend** — a least-squares slope over the last 10 smoothed
+  epochs below 0.001/epoch — not only on exhausted patience;
+- refuses to stop before `min_epochs`, so warmup is never mistaken for a plateau;
+- still **selects weights on the raw metric**, because you want the genuinely
+  best epoch even though you judge termination on the trend.
+
+On the synthetic end-to-end run this cut folds from 80 epochs to 30–34 with no
+loss of accuracy.
 
 ### Read the number honestly
 
