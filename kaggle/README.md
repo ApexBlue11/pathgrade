@@ -7,6 +7,25 @@ reproducible from source rather than from someone's notebook history.
 |---|---|---|
 | `preflight.py` | CPU | verifies the dataset mount, HF token, gated model access, openslide and the GDC query before any quota is spent |
 | `extract_tpu.py` | TPU | streams all labelled slides from GDC, encodes with H-optimus-0, writes embeddings |
+| `train_tpu.py` | TPU VM (CPU) | cross-validated training, locked-set evaluation, release bundle |
+
+## Order matters: TPU concurrency is 1
+
+Only one TPU session may run at a time, so `train_tpu.py` must not be pushed
+while extraction is queued or running - it would compete for the same slot.
+Push it only once extraction reports COMPLETE.
+
+`train_tpu.py` consumes the extraction output through `kernel_sources`, so
+there is no manual dataset-publish step between the two.
+
+## Why training uses the CPU of a TPU VM
+
+The head is ~530K parameters. XLA compiles per input shape, and the training
+loop varies subspace and crop counts by design, so it would recompile
+constantly. The TPU VM carries 224 vCPU and 406 GB RAM, which is far more than
+this model needs - it trains in minutes with no compilation risk. The TPU
+*devices* are the right tool for extraction (a 1B-parameter encoder over
+millions of tiles) and the wrong one for the aggregator.
 
 ## Secrets do not survive an API push
 
