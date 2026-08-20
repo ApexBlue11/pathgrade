@@ -309,6 +309,17 @@ def run(args) -> int:
         records = one_slide_per_patient(records)
     print(f"GDC {args.project}: {summarise(records)}")
 
+    # Slides without a grade label cannot train anything, and downloading them
+    # is the most expensive way to waste time in this pipeline.
+    if args.labels_csv:
+        from ..data.splits import read_labels
+
+        labelled = set(read_labels(args.labels_csv))
+        before = len(records)
+        records = [r for r in records if r.patient_id in labelled]
+        print(f"restricted to labelled patients: {len(records)}/{before} "
+              f"({summarise(records)})")
+
     records = shard(records, args.shard, args.num_shards)
     if args.limit:
         records = records[: args.limit]
@@ -431,6 +442,9 @@ def build_parser():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--cache-dir", default="/tmp/wsi_cache", help="scratch for in-flight slides")
     p.add_argument("--project", default="TCGA-HNSC")
+    p.add_argument("--labels-csv", default=None,
+                   help="restrict to patients present in this CSV. Skips slides "
+                        "that cannot contribute to training")
     p.add_argument("--encoder", default=DEFAULT_ENCODER)
     p.add_argument("--format", choices=["pt", "h5"], default="h5")
     p.add_argument("--device", default="auto", help="auto | cuda | xla | cpu")
