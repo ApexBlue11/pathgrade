@@ -1,0 +1,24 @@
+# Core
+torch>=2.2
+numpy>=1.26
+h5py>=3.10
+scikit-learn>=1.4
+PyYAML>=6.0
+
+# Feature extraction only (step 1). Not needed to train or evaluate from
+# pre-extracted embeddings.
+timm>=1.0.9              # loads H-optimus-0 / Virchow / Hibou from the HF hub
+torchvision>=0.17
+openslide-python>=1.3    # also needs the OpenSlide C library, see below
+Pillow>=10.0
+
+# Dev
+pytest>=8.0
+
+# OpenSlide native library:
+#   Ubuntu/Debian : sudo apt-get install openslide-tools
+#   macOS         : brew install openslide
+#   Windows       : pip install openslide-bin
+#
+# Gated encoders need a Hugging Face token with the model licence accepted:
+#   huggingface-cli login

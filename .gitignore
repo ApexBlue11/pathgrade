@@ -1,0 +1,32 @@
+# Data and model artefacts — never commit these
+data/
+runs/
+*.h5
+*.svs
+*.ndpi
+*.tiff
+*.pt
+*.pth
+*.ckpt
+*.npz
+
+# Extraction outputs
+extraction_manifest.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+.env

@@ -1,0 +1,88 @@
+pathgrade
+Copyright 2026 pathgrade contributors
+
+This product includes software developed by the pathgrade contributors,
+licensed under the Apache License, Version 2.0.
+
+================================================================================
+THIRD-PARTY MODELS
+================================================================================
+
+This repository contains NO third-party model weights. Encoder weights are
+downloaded at runtime from Hugging Face under their own licences, which are not
+superseded by this repository's Apache-2.0 licence.
+
+Commercially usable encoders supported by this project
+------------------------------------------------------
+
+  H-optimus-0 -- Bioptimus -- Apache-2.0
+    https://huggingface.co/bioptimus/H-optimus-0
+
+  Virchow (v1) -- Paige AI -- Apache-2.0
+    https://huggingface.co/paige-ai/Virchow
+
+  Hibou-B / Hibou-L -- HistAI -- Apache-2.0
+    https://huggingface.co/histai/hibou-L
+
+  Midnight -- kaiko.ai -- MIT
+    https://huggingface.co/kaiko-ai/midnight
+
+Encoders deliberately BLOCKED in src/pathgrade/encoders.py
+-----------------------------------------------------------
+
+  UNI, UNI2-h -- Mahmood Lab -- CC-BY-NC-ND-4.0
+    The gated access agreement prohibits commercial use of UNI and of
+    derivatives, where derivatives expressly include models trained on
+    outputs of the UNI model. Any MIL head trained on UNI embeddings
+    inherits that restriction.
+
+  Prov-GigaPath -- Microsoft Research -- see model card
+    Hugging Face tags this repository apache-2.0, which covers the code.
+    The model card states that any deployed use case, commercial or
+    otherwise, is out of scope. The metadata tag is not the operative term.
+
+  Virchow2 -- Paige AI -- CC-BY-NC-ND-4.0
+  H-optimus-1 -- Bioptimus -- CC-BY-NC-ND-4.0
+  Phikon, Phikon-v2 -- Owkin -- Owkin non-commercial licence
+
+Licence status was verified in August 2026 and can change. Re-verify before
+any release, and have counsel review before commercial deployment. Nothing in
+this file is legal advice.
+
+================================================================================
+DATA
+================================================================================
+
+TCGA-HNSC whole-slide images and clinical annotations originate from The Cancer
+Genome Atlas, a joint effort of NCI and NHGRI. Open-access TCGA data carries no
+restriction on commercial use, but users must not attempt to re-identify
+subjects and should follow current NIH data-use guidance.
+
+  https://www.cancer.gov/tcga
+
+================================================================================
+METHODS
+================================================================================
+
+The aggregator implements ideas from the following publications. None of their
+code is vendored here; the implementations are original.
+
+  ASMIL -- attention stabilisation via an EMA anchor and normalised sigmoid.
+    "ASMIL: Attention-Stabilized Multiple Instance Learning for Whole Slide
+    Imaging", arXiv:2603.06658
+
+  nnMIL -- fixed-size sub-bags, feature-subspace attention, subspace ensembling.
+    "nnMIL: A generalizable multiple instance learning framework for
+    computational pathology", arXiv:2511.14907
+
+  CORN -- rank-consistent ordinal regression via conditional probabilities.
+    Shi, Cao & Raschka, "Deep Neural Networks for Rank-Consistent Ordinal
+    Regression Based On Conditional Probabilities", arXiv:2111.08851
+
+  ACMIL -- multi-branch attention with a diversity penalty.
+    "Attention-Challenging Multiple Instance Learning for Whole Slide Image
+    Classification", arXiv:2311.07125
+
+  ABMIL -- gated attention pooling.
+    Ilse, Tomczak & Welling, "Attention-based Deep Multiple Instance
+    Learning", ICML 2018

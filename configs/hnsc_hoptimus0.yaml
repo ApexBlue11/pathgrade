@@ -1,0 +1,48 @@
+# TCGA-HNSC tumour grading — H-optimus-0 (Apache-2.0) + ASMIL-Ord.
+#
+# Every setting that moves a reported number lives here and is copied into the
+# run directory alongside the results.
+
+run_name: asmil-ord-hoptimus0
+output_dir: runs
+seed: 20260820
+
+encoder: h-optimus-0        # Apache-2.0. See src/pathgrade/encoders.py for the
+allow_noncommercial: false  # licence table; `true` unlocks research-only models.
+
+data:
+  feature_dir: data/features/h-optimus-0
+  labels_csv: data/tcga_hnsc_labels.csv
+  splits_path: data/splits.json
+  bag_size: null            # null -> half the cohort's median patch count
+  n_classes: 3
+  class_names: [G1, G2, G3]
+
+model:
+  feature_dim: null         # null -> read from the .h5 files (1536 for H-optimus-0)
+  window: 256               # dims the attention scorer sees
+  stride: 64                # -> 24 overlapping subspaces = a free 24-way ensemble
+  hidden: 256
+  n_branches: 5             # ACMIL-style parallel attention heads
+  dropout: 0.25
+  branch_drop: 0.5          # ASMIL token dropping; the paper's ablation peaks near 0.5
+  ema_decay: 0.99           # anchor EMA
+  feature_norm: true
+
+loss:
+  beta: 1.0                 # attention stabilisation (ASMIL)
+  gamma: 0.1                # branch diversity (ACMIL)
+  lambda_qwk: 0.2           # soft-QWK auxiliary; 0 disables
+
+optim:
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  epochs: 80
+  warmup_epochs: 5
+  batch_size: 8
+  grad_clip: 1.0
+  patience: 20
+  num_workers: 4
+  amp: true
+  balanced_sampling: true   # preferred over loss weighting; keeps the loss a clean likelihood
+  eval_offsets: 6           # subspaces per epoch-validation (all 24 used for final scoring)

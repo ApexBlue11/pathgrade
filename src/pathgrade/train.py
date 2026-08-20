@@ -1,0 +1,296 @@
+"""Cross-validated training for ASMIL-Ord.
+
+Model selection happens on CV folds only. The locked test set defined in
+``splits.json`` is never touched here - see :mod:`pathgrade.evaluate`, which is
+the only entry point permitted to read it.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from .config import Config
+from .data.dataset import (
+    SlideBagDataset,
+    SlideCropIterator,
+    balanced_sampler,
+    feature_dim,
+    suggest_bag_size,
+)
+from .data.splits import load_splits
+from .encoders import check_licence
+from .losses import ASMILOrdLoss, corn_cumulative_probs
+from .metrics import GradingMetrics, aggregate_folds, compute_metrics, format_confusion
+from .models.asmil_ord import ASMILOrd
+
+
+def set_seed(seed: int) -> None:
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
+    """Linear warmup then cosine decay to 1% of peak."""
+    warmup = max(1, cfg.optim.warmup_epochs * steps_per_epoch)
+    total = max(warmup + 1, cfg.optim.epochs * steps_per_epoch)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup:
+            return step / warmup
+        progress = (step - warmup) / max(1, total - warmup)
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def predict_loader(model, loader, device, n_offsets: int | None = None):
+    """Fast path: one deterministic sub-bag per slide."""
+    model.eval()
+    cums, ys, pids = [], [], []
+    for batch in loader:
+        out = model(batch["features"].to(device), batch["mask"].to(device), n_offsets=n_offsets)
+        cums.append(corn_cumulative_probs(out.logits).float().cpu())
+        ys.append(batch["label"])
+        pids.extend(batch["patient_id"])
+    return torch.cat(cums), torch.cat(ys), pids
+
+
+@torch.no_grad()
+def predict_slide_full(model, path, bag_size: int, device, n_offsets: int | None = None):
+    """Full coverage: every patch used exactly once, cumulative probs averaged.
+
+    Averaging *cumulative* probabilities rather than logits keeps the result
+    rank-consistent - the mean of monotone sequences is monotone.
+    """
+    model.eval()
+    cums = []
+    for feats, mask in SlideCropIterator(path, bag_size):
+        out = model(feats.unsqueeze(0).to(device), mask.unsqueeze(0).to(device), n_offsets=n_offsets)
+        cums.append(corn_cumulative_probs(out.logits)[0].float().cpu())
+    return torch.stack(cums).mean(dim=0)
+
+
+def evaluate_full(model, ids, labels, feature_dir, bag_size, device, n_classes=3, bootstrap=0):
+    cums = torch.stack([
+        predict_slide_full(model, Path(feature_dir) / f"{pid}.h5", bag_size, device) for pid in ids
+    ])
+    preds = (cums > 0.5).sum(dim=1).numpy()
+    truth = np.array([labels[pid] for pid in ids])
+    metrics = compute_metrics(truth, preds, n_classes, bootstrap=bootstrap)
+    return metrics, cums.numpy(), preds, truth
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tuple[dict, GradingMetrics]:
+    set_seed(cfg.seed + fold)
+    d = cfg.data
+
+    train_ds = SlideBagDataset(train_ids, labels, d.feature_dir, d.bag_size, train=True)
+    val_ds = SlideBagDataset(val_ids, labels, d.feature_dir, d.bag_size, train=False)
+
+    sampler = balanced_sampler(train_ds.label_list, seed=cfg.seed + fold) if cfg.optim.balanced_sampling else None
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.optim.batch_size, sampler=sampler,
+        shuffle=sampler is None, num_workers=cfg.optim.num_workers,
+        pin_memory=device.type == "cuda", drop_last=len(train_ds) > cfg.optim.batch_size,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg.optim.batch_size, shuffle=False,
+        num_workers=cfg.optim.num_workers, pin_memory=device.type == "cuda",
+    )
+
+    model = ASMILOrd(
+        feature_dim=cfg.model.feature_dim, n_classes=d.n_classes, window=cfg.model.window,
+        stride=cfg.model.stride, hidden=cfg.model.hidden, n_branches=cfg.model.n_branches,
+        dropout=cfg.model.dropout, branch_drop=cfg.model.branch_drop,
+        ema_decay=cfg.model.ema_decay, feature_norm=cfg.model.feature_norm,
+    ).to(device)
+
+    criterion = ASMILOrdLoss(d.n_classes, cfg.loss.beta, cfg.loss.gamma, cfg.loss.lambda_qwk)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay,
+    )
+    scheduler = build_scheduler(optimizer, cfg, max(1, len(train_loader)))
+    use_amp = cfg.optim.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    best = {"qwk": -2.0, "epoch": -1, "state": None}
+    history, no_improve = [], 0
+
+    for epoch in range(1, cfg.optim.epochs + 1):
+        model.train()
+        epoch_loss, parts_acc, n_batches = 0.0, {}, 0
+        for batch in train_loader:
+            x = batch["features"].to(device, non_blocking=True)
+            m = batch["mask"].to(device, non_blocking=True)
+            y = batch["label"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = model(x, m)
+                loss, parts = criterion(out.logits, y, out.aux)
+
+            scaler.scale(loss).backward()
+            if cfg.optim.grad_clip:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            model.update_anchor()          # EMA anchor tracks the online scorer
+
+            epoch_loss += float(loss.detach())
+            for k, v in parts.items():
+                parts_acc[k] = parts_acc.get(k, 0.0) + v
+            n_batches += 1
+
+        n_batches = max(n_batches, 1)
+        cums, ys, _ = predict_loader(model, val_loader, device, n_offsets=cfg.optim.eval_offsets)
+        preds = (cums > 0.5).sum(dim=1).numpy()
+        m_val = compute_metrics(ys.numpy(), preds, d.n_classes)
+
+        history.append({
+            "epoch": epoch,
+            "loss": epoch_loss / n_batches,
+            "parts": {k: v / n_batches for k, v in parts_acc.items()},
+            "val_qwk": m_val.qwk,
+            "val_macro_f1": m_val.macro_f1,
+            "lr": scheduler.get_last_lr()[0],
+        })
+
+        improved = m_val.qwk > best["qwk"] + 1e-5
+        if improved:
+            best = {
+                "qwk": m_val.qwk,
+                "epoch": epoch,
+                "state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            }
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        print(
+            f"  fold {fold} ep {epoch:03d}/{cfg.optim.epochs} "
+            f"loss {epoch_loss / n_batches:.4f} | val QWK {m_val.qwk:.4f} "
+            f"F1 {m_val.macro_f1:.4f} | best {best['qwk']:.4f} @{best['epoch']} "
+            f"| patience {cfg.optim.patience - no_improve}"
+        )
+
+        if no_improve >= cfg.optim.patience:
+            print(f"  fold {fold}: early stop at epoch {epoch}")
+            break
+
+    model.load_state_dict(best["state"])
+    m_final, cums, preds, truth = evaluate_full(
+        model, val_ids, labels, d.feature_dir, d.bag_size, device, d.n_classes
+    )
+
+    fold_dir = cfg.run_dir / f"fold{fold}"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": best["state"],
+            "config": cfg.to_dict(),
+            "fold": fold,
+            "val_qwk_subbag": best["qwk"],
+            "val_qwk_full": m_final.qwk,
+            "epoch": best["epoch"],
+        },
+        fold_dir / "checkpoint.pt",
+    )
+    with open(fold_dir / "history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    np.savez(
+        fold_dir / "val_predictions.npz",
+        patient_ids=np.array(val_ids), cumulative=cums, pred=preds, true=truth,
+    )
+
+    return {"fold": fold, "best_epoch": best["epoch"], "history": history}, m_final
+
+
+def run_cv(cfg: Config) -> dict:
+    check_licence(cfg.encoder, cfg.allow_noncommercial)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    splits = load_splits(cfg.data.splits_path)
+    labels = splits.labels
+
+    dev_ids = sorted({p for f in splits.folds for p in f["train"] + f["val"]})
+    if cfg.data.bag_size is None:
+        cfg.data.bag_size = suggest_bag_size(cfg.data.feature_dir, dev_ids)
+    if cfg.model.feature_dim is None:
+        cfg.model.feature_dim = feature_dim(cfg.data.feature_dir, dev_ids)
+
+    cfg.run_dir.mkdir(parents=True, exist_ok=True)
+    cfg.save(cfg.run_dir / "config.json")
+
+    print(f"\n{cfg.run_name}  |  encoder {cfg.encoder} ({cfg.model.feature_dim}-d)")
+    print(f"device {device} | bag_size {cfg.data.bag_size} | {len(splits.folds)} folds")
+    print(f"test set held back: {len(splits.test)} patients (fingerprint {splits.fingerprint})\n")
+
+    fold_metrics, fold_logs = [], []
+    t0 = time.time()
+    for i, fold in enumerate(splits.folds):
+        log, metrics = train_fold(cfg, i, fold["train"], fold["val"], labels, device)
+        fold_metrics.append(metrics)
+        fold_logs.append(log)
+        print(f"  fold {i} final (full coverage): {metrics.summary()}\n")
+
+    summary = aggregate_folds(fold_metrics)
+    summary["elapsed_minutes"] = round((time.time() - t0) / 60, 1)
+    summary["bag_size"] = cfg.data.bag_size
+    summary["feature_dim"] = cfg.model.feature_dim
+    summary["folds"] = [
+        {"fold": i, "best_epoch": lg["best_epoch"], **{k: getattr(m, k) for k in
+         ("qwk", "macro_f1", "balanced_accuracy", "adjacent_accuracy", "mean_absolute_error")}}
+        for i, (lg, m) in enumerate(zip(fold_logs, fold_metrics))
+    ]
+
+    with open(cfg.run_dir / "cv_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("=" * 72)
+    print("CROSS-VALIDATION SUMMARY  (model selection only - test set untouched)")
+    for key in ("qwk", "macro_f1", "balanced_accuracy", "adjacent_accuracy"):
+        s = summary[key]
+        per = ", ".join(f"{v:.3f}" for v in s["per_fold"])
+        print(f"  {key:<20} {s['mean']:.4f} +/- {s['std']:.4f}   [{per}]")
+    print(f"  elapsed              {summary['elapsed_minutes']} min")
+    print("=" * 72)
+    return summary
+
+
+def main(argv=None):
+    import argparse
+
+    p = argparse.ArgumentParser(description="Cross-validated ASMIL-Ord training.")
+    p.add_argument("--config", required=True)
+    p.add_argument("--run-name", default=None)
+    args = p.parse_args(argv)
+
+    cfg = Config.load(args.config)
+    if args.run_name:
+        cfg.run_name = args.run_name
+    run_cv(cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
