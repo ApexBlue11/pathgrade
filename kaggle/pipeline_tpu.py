@@ -117,11 +117,27 @@ print(f"vCPU {multiprocessing.cpu_count()}")
 for path in ("/kaggle/working", "/kaggle/tmp"):
     if os.path.isdir(path):
         print(f"{path:16s} {shutil.disk_usage(path)[2] / 1e9:7.1f} GB free")
+ACCEL = None
 try:
     import torch_xla.core.xla_model as xm
     print(f"XLA: {xm.xla_device()}", flush=True)
+    ACCEL = "xla"
 except Exception as e:
-    print(f"no XLA ({e}) - extraction will fall back", flush=True)
+    print(f"no XLA ({e})", flush=True)
+    if torch.cuda.is_available():
+        ACCEL = "cuda"
+        print(f"CUDA: {torch.cuda.get_device_name(0)}", flush=True)
+
+# Refuse to encode on a bare CPU session. H-optimus-0 is a 1B-parameter ViT-g;
+# it runs at ~0.4 patches/s on CPU, so 435 slides would take several hundred
+# hours. Far better to fail in ten seconds than to look busy for a whole
+# session and produce nothing.
+if ACCEL is None:
+    sys.exit(
+        "FATAL: no accelerator. This notebook is set to CPU. "
+        "Settings > Accelerator > TPU VM, then Save & Run All. "
+        "Encoding on CPU would take ~400 hours."
+    )
 
 MAX_PATCHES = 6000
 
@@ -137,7 +153,7 @@ extract_argv = [
     "--cache-dir", str(CACHE),
     "--labels-csv", f"{SRC}/tcga_hnsc_labels.csv",
     "--encoder", "h-optimus-0",
-    "--device", "xla",
+    "--device", ACCEL,
     "--format", "h5",
     "--max-patches", str(MAX_PATCHES),
     "--batch-size", "64",
