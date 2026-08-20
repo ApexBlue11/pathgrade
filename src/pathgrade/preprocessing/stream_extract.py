@@ -68,14 +68,30 @@ def write_features(path: Path, feats: np.ndarray, coords: np.ndarray, attrs: dic
 
 
 class SlidePrefetcher:
-    """Downloads slides one step ahead of the encoder, on a background thread."""
+    """Downloads slides ahead of the encoder, over several concurrent streams.
 
-    def __init__(self, records: list[SlideRecord], cache_dir: Path, depth: int = 1):
+    Single-stream GDC throughput measured 25.6 MB/s from a Kaggle TPU VM, but
+    four concurrent streams reached 143 MB/s aggregate - GDC does not rate-limit
+    a single client, the per-connection ceiling is just low. Since download is
+    the dominant cost of the whole job, this 5.6x is the most valuable
+    optimisation in the pipeline.
+
+    Concurrency is bounded by a semaphore counting slides *on disk*, not by the
+    thread count: the consumer releases a slot only after deleting the slide it
+    just encoded, so peak disk use stays at ``max_on_disk`` slides regardless of
+    how fast downloads complete.
+    """
+
+    def __init__(self, records: list[SlideRecord], cache_dir: Path,
+                 max_on_disk: int = 4, workers: int = 4):
         self.records = records
         self.cache_dir = cache_dir
-        self.queue: queue.Queue = queue.Queue(maxsize=depth)
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.workers = max(1, workers)
+        self.max_on_disk = max(1, max_on_disk)
+        self.queue: queue.Queue = queue.Queue()
+        self._slots = threading.Semaphore(self.max_on_disk)
         self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self.thread.start()
@@ -83,24 +99,59 @@ class SlidePrefetcher:
 
     def stop(self):
         self._stop.set()
-        # Drain so a blocked producer can notice the stop flag and exit.
+        for _ in range(self.max_on_disk + self.workers):
+            self._slots.release()          # unblock any waiting downloader
+
+    def release(self):
+        """Consumer calls this once it has deleted a slide from disk."""
+        self._slots.release()
+
+    def _fetch(self, record: SlideRecord):
+        """Runs on a pool thread. The disk slot is already held on its behalf."""
+        if self._stop.is_set():
+            self._slots.release()
+            return (record, None, "stopped")
         try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
+            t0 = time.time()
+            path = download_slide(record, self.cache_dir)
+            return (record, path, time.time() - t0)
+        except Exception as e:
+            self._slots.release()          # nothing landed on disk
+            return (record, None, str(e))
 
     def _run(self):
-        for record in self.records:
-            if self._stop.is_set():
-                break
-            try:
-                t0 = time.time()
-                path = download_slide(record, self.cache_dir)
-                self.queue.put((record, path, time.time() - t0))
-            except Exception as e:
-                self.queue.put((record, None, str(e)))
-        self.queue.put(None)             # sentinel
+        """Producer. Acquires each disk slot *before* submitting, in record order.
+
+        Acquiring inside the worker instead would deadlock: freed threads pick
+        up later records, those grab the released slots, and the consumer - which
+        must take results in order - waits forever on an earlier record that can
+        no longer get a slot. Reserving in submission order makes the in-flight
+        set always the earliest unconsumed records, so progress is guaranteed.
+        """
+        pending: deque = deque()
+        records = iter(self.records)
+        try:
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                for _ in range(self.max_on_disk):
+                    record = next(records, None)
+                    if record is None:
+                        break
+                    self._slots.acquire()
+                    pending.append(pool.submit(self._fetch, record))
+
+                while pending:
+                    self.queue.put(pending.popleft().result())
+                    if self._stop.is_set():
+                        break
+                    record = next(records, None)
+                    if record is None:
+                        continue
+                    self._slots.acquire()   # blocks until the consumer frees disk
+                    if self._stop.is_set():
+                        break
+                    pending.append(pool.submit(self._fetch, record))
+        finally:
+            self.queue.put(None)            # sentinel
 
     def __iter__(self):
         while True:
@@ -307,7 +358,9 @@ def run(args) -> int:
         webhook_url=args.webhook_url, notify_every=args.notify_every,
     )
     reporter.notify(f"START shard {args.shard}: {len(todo)} slides on {device}")
-    prefetcher = SlidePrefetcher(todo, cache_dir, depth=args.prefetch).start()
+    prefetcher = SlidePrefetcher(
+        todo, cache_dir, max_on_disk=args.prefetch, workers=args.download_workers
+    ).start()
 
     done, failed, patches = 0, 0, 0
     deadline = time.time() + args.max_hours * 3600 if args.max_hours else None
@@ -353,9 +406,11 @@ def run(args) -> int:
                 print(f"  {record.patient_id}: EXTRACT FAILED - {e}", file=sys.stderr)
                 reporter.update(False, extra={"last_error": f"{record.patient_id}: {e}"})
             finally:
-                # The whole point: reclaim the disk immediately.
+                # The whole point: reclaim the disk immediately, then hand the
+                # slot back so another download can start.
                 if not args.keep_slides:
                     Path(slide_path).unlink(missing_ok=True)
+                prefetcher.release()
     finally:
         prefetcher.stop()
         reporter.finish(f"{patches:,} patches")
@@ -392,7 +447,11 @@ def build_parser():
     p.add_argument("--tissue-frac", type=float, default=0.35)
     p.add_argument("--batch-size", type=int, default=64,
                    help="keep constant on TPU; it defines the compiled graph")
-    p.add_argument("--prefetch", type=int, default=1, help="slides to fetch ahead")
+    p.add_argument("--prefetch", type=int, default=4,
+                   help="max slides held on disk at once")
+    p.add_argument("--download-workers", type=int, default=4,
+                   help="concurrent GDC streams. Measured 25.6 MB/s single vs "
+                        "143 MB/s at 4 streams, so this matters more than anything else")
     p.add_argument("--decode-workers", type=int, default=max(4, (os.cpu_count() or 8)),
                    help="threads decoding tiles. This, not the accelerator, is usually the limit")
     p.add_argument("--queue-depth", type=int, default=3, help="tile batches decoded ahead")

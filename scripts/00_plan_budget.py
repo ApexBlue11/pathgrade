@@ -18,7 +18,7 @@ from pathgrade.preprocessing.gdc import one_slide_per_patient, query_slides, sum
 
 # Effective (not peak) throughput, bf16/fp16 inference including data stalls.
 ACCELERATORS = {
-    "tpu-v5e-8":  {"tflops": 550.0, "note": "Kaggle TPU VM v5e-8, ~35% MFU"},
+    "tpu-v5e-8":  {"tflops": 540.0, "note": "MEASURED 1226 patches/s, 224 vCPU host"},
     "tpu-v3-8":   {"tflops": 140.0, "note": "Kaggle TPU VM v3-8"},
     "gpu-t4x2":   {"tflops": 55.0,  "note": "Kaggle 2x T4, fp16"},
     "gpu-p100":   {"tflops": 12.0,  "note": "Kaggle P100, fp16"},
@@ -37,8 +37,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--project", default="TCGA-HNSC")
     p.add_argument("--encoder", default="h-optimus-0")
-    p.add_argument("--max-patches", type=int, default=4000)
-    p.add_argument("--download-mbps", type=float, default=50.0, help="measured MB/s from GDC")
+    p.add_argument("--max-patches", type=int, default=8000)
+    p.add_argument("--download-mbps", type=float, default=143.0,
+                   help="measured MB/s from GDC. Default is the Kaggle TPU VM "
+                        "figure at 4 parallel streams (25.6 single-stream)")
     p.add_argument("--decode-tiles-per-sec", type=float, default=None,
                    help="measured tile decode rate. Default scales a measured "
                         "27 tiles/s/vCPU by this machine's core count")

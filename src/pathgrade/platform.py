@@ -38,9 +38,14 @@ class SessionSpec:
 
 KAGGLE = {
     "tpu": SessionSpec(
-        name="tpu", max_concurrent=1, vcpu=0, weekly_hours=20.0, session_hours=9.0,
-        accelerator="TPU VM", can_encode=True,
-        note="Only ONE at a time. Cannot be sharded across sessions.",
+        name="tpu", max_concurrent=1, vcpu=224, weekly_hours=20.0, session_hours=9.0,
+        accelerator="TPU VM v5e-8 (8 XLA devices, torch_xla 2.8.0)", can_encode=True,
+        note=(
+            "Only ONE at a time, and it queued ~23 min before starting. But the "
+            "host is enormous: 224 vCPU, 406 GB RAM, 1098 GB on /kaggle/tmp. "
+            "One session covers the whole cohort, so the concurrency limit of 1 "
+            "does not bite."
+        ),
     ),
     "gpu": SessionSpec(
         name="gpu", max_concurrent=2, vcpu=4, weekly_hours=30.0, session_hours=12.0,
@@ -59,8 +64,8 @@ KAGGLE = {
 }
 
 # Kaggle disk, measured: /kaggle/working persists and becomes the dataset output.
-KAGGLE_WORKING_GB = 20.0
-KAGGLE_TMP_GB = 60.0
+KAGGLE_WORKING_GB = 20.9      # measured; this is the hard output cap
+KAGGLE_TMP_GB = 1098.4        # measured on the TPU VM - far larger than documented
 
 # Tile decode, threaded with a shared OpenSlide handle, 0.5 um/px -> 224 px.
 # 329 tiles/s measured on 12 vCPU; roughly linear in cores until disk-bound.
@@ -71,14 +76,26 @@ ENCODE_PATCHES_PER_SEC = {
     "cpu-12core": 0.38,        # measured
     "p100": 25.0,              # estimated from 12 TFLOPS fp16
     "t4x2": 100.0,             # estimated
-    "tpu-v5e-8": 1000.0,       # estimated, pending measurement
+    "tpu-v5e-8": 1226.2,       # MEASURED, bf16 batch 64
 }
+
+# Measured on the Kaggle TPU VM (224 vCPU). Peaks at 16 threads; 224 threads is
+# slower, so oversubscription hurts. NOTE: sampled over only 72 tiles of an
+# 11 MB slide, so page cache likely flattered it - treat as an upper bound.
+TPU_VM_DECODE_TILES_PER_SEC = 1654.6
 
 # GDC sustained download, measured per-origin. Wildly origin-dependent.
 GDC_MBPS = {
-    "home-broadband-in": 0.23,  # measured: this dev machine
-    "kaggle": None,             # pending benchmark
+    "home-broadband-in": 0.23,   # measured: dev machine, single stream
+    "kaggle-1-stream": 25.62,    # measured on the TPU VM
+    "kaggle-2-streams": 63.56,   # measured, aggregate
+    "kaggle-4-streams": 143.26,  # measured, aggregate -> 5.6x over single
 }
+
+# Parallel GDC streams scale near-linearly: the per-connection ceiling is low
+# but there is no per-client rate limit. Download dominates the job, so this is
+# the highest-value setting in the pipeline.
+DEFAULT_DOWNLOAD_STREAMS = 4
 
 
 def viable_encoders() -> list[SessionSpec]:

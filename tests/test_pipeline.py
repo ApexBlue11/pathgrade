@@ -328,3 +328,70 @@ def test_encode_tiles_handles_ragged_final_batch(monkeypatch):
     )
     assert feats.shape == (n, 4)
     assert np.array_equal(feats[:, 0], np.arange(n, dtype=np.float32) % 251)
+
+
+# --------------------------------------------------------------------------
+# Parallel slide prefetch: concurrency must not exceed the disk budget
+# --------------------------------------------------------------------------
+def test_prefetcher_bounds_slides_on_disk(monkeypatch, tmp_path):
+    """Downloads run concurrently, but never more than max_on_disk land at once."""
+    import threading
+    from pathgrade.preprocessing import stream_extract as se
+    from pathgrade.preprocessing.gdc import SlideRecord
+
+    on_disk = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_download(record, cache_dir, **kw):
+        nonlocal on_disk, peak
+        with lock:
+            on_disk += 1
+            peak = max(peak, on_disk)
+        time.sleep(0.02)
+        p = Path(cache_dir) / record.file_name
+        p.write_bytes(b"x")
+        return p
+
+    monkeypatch.setattr(se, "download_slide", fake_download)
+
+    records = [SlideRecord(f"id{i}", f"S{i}.svs", 100, f"P{i}") for i in range(24)]
+    pf = se.SlidePrefetcher(records, tmp_path, max_on_disk=3, workers=8).start()
+
+    seen = []
+    for record, path, _info in pf:
+        seen.append(record.patient_id)
+        Path(path).unlink()
+        with lock:
+            on_disk -= 1
+        pf.release()
+
+    assert seen == [r.patient_id for r in records], "slides must arrive in order"
+    assert peak <= 3, f"peak {peak} slides on disk exceeded max_on_disk=3"
+    assert peak > 1, "downloads should overlap, not serialise"
+
+
+def test_prefetcher_reports_failures_without_consuming_a_slot(monkeypatch, tmp_path):
+    from pathgrade.preprocessing import stream_extract as se
+    from pathgrade.preprocessing.gdc import SlideRecord
+
+    def flaky(record, cache_dir, **kw):
+        if record.patient_id == "P1":
+            raise IOError("network went away")
+        p = Path(cache_dir) / record.file_name
+        p.write_bytes(b"x")
+        return p
+
+    monkeypatch.setattr(se, "download_slide", flaky)
+    records = [SlideRecord(f"id{i}", f"S{i}.svs", 10, f"P{i}") for i in range(4)]
+    pf = se.SlidePrefetcher(records, tmp_path, max_on_disk=2, workers=2).start()
+
+    results = []
+    for record, path, info in pf:
+        results.append((record.patient_id, path is not None))
+        if path:
+            Path(path).unlink()
+            pf.release()
+
+    assert ("P1", False) in results
+    assert len(results) == 4, "a failure must not stall the queue"
