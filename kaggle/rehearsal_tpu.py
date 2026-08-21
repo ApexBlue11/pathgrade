@@ -32,6 +32,10 @@ import time
 import traceback
 from pathlib import Path
 
+os.environ.setdefault("PATHGRADE_RANDOM_WEIGHTS", "1")
+os.environ.setdefault("PATHGRADE_LIMIT", "60")
+os.environ.setdefault("PATHGRADE_MAX_PATCHES", "3000")
+
 T0 = time.time()
 WORK = Path("/kaggle/working")
 OUT = WORK / "features"
