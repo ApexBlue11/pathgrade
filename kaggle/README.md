@@ -37,6 +37,29 @@ python kaggle/watch.py apexblue/pathgrade-pipeline
 python kaggle/watch.py apexblue/pathgrade-pipeline --grep "slides/h"
 ```
 
+## Measured end to end
+
+A dress rehearsal - the whole pipeline on 60 real slides with random weights -
+established these on actual TPU sessions, not from micro-benchmarks:
+
+| stage | measured | 435 slides |
+|---|---|---|
+| extraction | 87 slides/h at 3000 patches | ~5.0 h |
+| training (5-fold CV) | 2.8 min for 60 slides | ~0.5 h |
+| **total** | | **~5.5 h**, inside the 9 h cap |
+
+Two numbers worth distrusting if you see them quoted anywhere earlier:
+
+* **1226 patches/s for the encoder was fiction.** Without a `.cpu()` call XLA
+  builds a graph lazily and never executes it, so that benchmark timed graph
+  construction. Real throughput with the transfer the pipeline actually does is
+  ~124 patches/s - which matches physics, since `xla:0` is one core of eight.
+* **1654 tiles/s for decode was measured on an 11 MB cached slide.** Real
+  slides run 1900-2500 tiles/s from any mount, so storage was never the limit.
+
+Using all eight TPU cores is worth roughly 8x and is the obvious next
+optimisation, but it is multi-device plumbing and belongs after a working model.
+
 ## Launch checklist
 
 An API push cannot attach secrets, so the first push is deliberately made with
