@@ -275,6 +275,7 @@ def process_slide(
 
     attrs = {
         "encoder": encoder.spec.name,
+        "random_weights": bool(getattr(args, "random_weights", False)),
         "encoder_licence": encoder.spec.licence,
         "commercial_ok": encoder.spec.commercial_ok,
         "embed_dim": int(feats.shape[1]),
@@ -360,7 +361,7 @@ def run(args) -> int:
         )
     print()
 
-    encoder = PatchEncoder(spec, device=device)
+    encoder = PatchEncoder(spec, device=device, random_weights=args.random_weights)
     transform = encoder.build_transform()
 
     journal_path = out_dir / f"journal_shard{args.shard}.jsonl"
@@ -480,6 +481,9 @@ def build_parser():
     p.add_argument("--assume-mpp", type=float, default=None)
     p.add_argument("--fp32-store", action="store_true")
     p.add_argument("--allow-noncommercial", action="store_true")
+    p.add_argument("--random-weights", action="store_true",
+                   help="skip the pretrained download and use random weights. Exercises "
+                        "the full pipeline without a gated fetch; embeddings are garbage")
     p.add_argument("--webhook-url", default=None,
                    help="Discord/Slack/Telegram hook for phone notifications")
     p.add_argument("--notify-every", type=int, default=25, help="slides between pings")

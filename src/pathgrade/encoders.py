@@ -182,7 +182,8 @@ class PatchEncoder(nn.Module):
     graph, and keeping the dtype fixed avoids a second compilation.
     """
 
-    def __init__(self, spec: EncoderSpec, device: str | torch.device = "auto", dtype=None):
+    def __init__(self, spec: EncoderSpec, device: str | torch.device = "auto", dtype=None,
+                 random_weights: bool = False):
         super().__init__()
         try:
             import timm
@@ -198,9 +199,18 @@ class PatchEncoder(nn.Module):
             dtype = {"cuda": torch.float16, "xla": torch.bfloat16}.get(self.device_type, torch.float32)
         self.dtype = dtype
 
-        self.backbone = timm.create_model(
-            spec.hf_hub_id, pretrained=True, num_classes=0, **spec.timm_kwargs
-        )
+        if random_weights:
+            # Same architecture, no pretrained download. For exercising the
+            # pipeline - tiling, decode, device transfer, IO - without a gated
+            # weight fetch. Embeddings are meaningless; never train on them.
+            arch = {1536: "vit_giant_patch14_224", 2560: "vit_huge_patch14_224",
+                    1024: "vit_large_patch16_224"}.get(spec.embed_dim, "vit_giant_patch14_224")
+            print(f"!! RANDOM WEIGHTS ({arch}) - pipeline test only, embeddings are garbage")
+            self.backbone = timm.create_model(arch, pretrained=False, num_classes=0)
+        else:
+            self.backbone = timm.create_model(
+                spec.hf_hub_id, pretrained=True, num_classes=0, **spec.timm_kwargs
+            )
         self.backbone.eval().to(self.device)
         if self.is_xla:
             self.backbone.to(self.dtype)
