@@ -146,15 +146,23 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
     train_ds = SlideBagDataset(train_ids, labels, d.feature_dir, d.bag_size, train=True)
     val_ds = SlideBagDataset(val_ids, labels, d.feature_dir, d.bag_size, train=False)
 
+    # Preloading removes the IO that worker processes exist to hide, and each
+    # fork would otherwise copy the cache. Fall back to workers when streaming.
+    n_workers = 0 if train_ds._cache is not None else cfg.optim.num_workers
+    if train_ds._cache is not None:
+        gb = sum(v.nbytes for v in train_ds._cache.values()) / 1e9
+        print(f"  fold {fold}: {gb:.2f} GB of features held in RAM, dataloader workers off")
+
     sampler = balanced_sampler(train_ds.label_list, seed=cfg.seed + fold) if cfg.optim.balanced_sampling else None
     train_loader = DataLoader(
         train_ds, batch_size=cfg.optim.batch_size, sampler=sampler,
-        shuffle=sampler is None, num_workers=cfg.optim.num_workers,
+        shuffle=sampler is None, num_workers=n_workers,
         pin_memory=device.type == "cuda", drop_last=len(train_ds) > cfg.optim.batch_size,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.optim.batch_size, shuffle=False,
-        num_workers=cfg.optim.num_workers, pin_memory=device.type == "cuda",
+        num_workers=0 if val_ds._cache is not None else cfg.optim.num_workers,
+        pin_memory=device.type == "cuda",
     )
 
     model = ASMILOrd(

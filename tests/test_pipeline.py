@@ -16,6 +16,7 @@ from pathgrade.callbacks import EarlyStopping, WeightEMA, suggest_ema_decay
 from pathgrade.data.io import (
     feature_width, find_feature_file, patch_count, read_features, read_metadata, verify_cohort,
 )
+from pathgrade.data.dataset import SlideBagDataset
 from pathgrade.models.asmil_ord import ASMILOrd
 from pathgrade.preprocessing.gdc import (
     SlideRecord, one_slide_per_patient, patient_id_from_barcode, shard,
@@ -548,3 +549,81 @@ def test_random_arch_table_covers_every_registry_width(dim):
     widths = {s.embed_dim for s in REGISTRY.values()}
     assert widths <= set(RANDOM_ARCH), f"uncovered widths: {widths - set(RANDOM_ARCH)}"
     assert dim in RANDOM_ARCH
+
+
+@pytest.fixture
+def features(tmp_path):
+    """A small cohort on disk, with a spread of patch counts."""
+    import h5py
+
+    rng = np.random.default_rng(1)
+    d = tmp_path / "feat"
+    d.mkdir()
+    labels, counts = {}, {}
+    for i in range(8):
+        pid = f"Q{i:03d}"
+        n = int(rng.integers(200, 1200))
+        counts[pid] = n
+        labels[pid] = int(rng.integers(0, 3))
+        with h5py.File(d / f"{pid}.h5", "w") as f:
+            f.create_dataset("features", data=rng.standard_normal((n, 32)).astype(np.float16))
+            f.create_dataset("coords", data=rng.integers(0, 9999, (n, 2)))
+    return d, labels, counts
+
+
+# --------------------------------------------------------------------------
+# In-RAM feature cache
+#
+# Features are re-read every epoch and HDF5 decompression dominates the step
+# time, so the whole cohort is held in memory when it fits. The cached branch
+# needs explicit tests: auto-detection reads /proc/meminfo, so on any non-Linux
+# dev machine it silently stays off and the code path goes untested.
+# --------------------------------------------------------------------------
+def test_preloaded_dataset_matches_streaming_dataset(features):
+    d, labels, counts = features
+    ids = sorted(labels)
+    streamed = SlideBagDataset(ids, labels, d, bag_size=512, train=False, preload=False)
+    cached = SlideBagDataset(ids, labels, d, bag_size=512, train=False, preload=True)
+
+    assert cached._cache is not None and streamed._cache is None
+    for i in range(len(ids)):
+        a, b = streamed[i], cached[i]
+        assert a["patient_id"] == b["patient_id"]
+        assert a["n_patches"] == b["n_patches"], "n_patches must survive the cached path"
+        assert torch.equal(a["mask"], b["mask"])
+        assert torch.allclose(a["features"], b["features"])
+
+
+def test_preload_populates_every_slide(features):
+    d, labels, _ = features
+    ids = sorted(labels)
+    ds = SlideBagDataset(ids, labels, d, bag_size=256, preload=True)
+    assert set(ds._cache) == set(ids)
+    assert all(v.dtype == np.float32 for v in ds._cache.values())
+
+
+def test_preload_off_leaves_no_cache(features):
+    d, labels, _ = features
+    ds = SlideBagDataset(sorted(labels), labels, d, bag_size=256, preload=False)
+    assert ds._cache is None
+
+
+def test_preload_declined_when_cohort_dwarfs_memory(features, monkeypatch):
+    """Auto-detection must stream rather than exhaust a small machine."""
+    d, labels, _ = features
+    monkeypatch.setattr(
+        SlideBagDataset, "_estimated_bytes", lambda self: 10 ** 15
+    )
+    ds = SlideBagDataset(sorted(labels), labels, d, bag_size=256, preload=None)
+    assert ds._cache is None
+
+
+def test_cached_training_still_randomises_sub_bags(features):
+    """Caching must not accidentally freeze the augmentation."""
+    d, labels, _ = features
+    big = [p for p in sorted(labels) if patch_count(str(find_feature_file(d, p))) > 600]
+    if not big:
+        pytest.skip("fixture has no slide larger than the bag")
+    ds = SlideBagDataset(big[:1], labels, d, bag_size=256, train=True, preload=True)
+    first, second = ds[0]["features"], ds[0]["features"]
+    assert not torch.allclose(first, second), "sub-bag sampling should differ per call"
