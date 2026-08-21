@@ -54,6 +54,12 @@ def find_src(marker="src/pathgrade/__init__.py", root="/kaggle/input"):
 
 # ------------------------------------------------------------ 0. PREFLIGHT
 banner("0. PREFLIGHT")
+MAX_PATCHES = int(os.environ.get("PATHGRADE_MAX_PATCHES", "3000"))
+BATCH_SIZE = os.environ.get("PATHGRADE_BATCH", "256")
+DECODE_WORKERS = os.environ.get("PATHGRADE_DECODE_WORKERS", "16")
+SLIDE_LIMIT = os.environ.get("PATHGRADE_LIMIT")
+RANDOM_WEIGHTS = os.environ.get("PATHGRADE_RANDOM_WEIGHTS") == "1"
+
 SRC = find_src()
 if SRC is None:
     sys.exit("FATAL: pathgrade-src dataset not mounted")
@@ -90,7 +96,10 @@ def load_token():
 
 token_source = load_token()
 print(f"HF token: {token_source or 'NOT FOUND'}", flush=True)
-if token_source is None:
+if RANDOM_WEIGHTS and token_source is None:
+    # Rehearsal mode never downloads weights, so a token would be pointless.
+    print("REHEARSAL: no token needed (random weights)", flush=True)
+elif token_source is None:
     sys.exit(
         "FATAL: no HF token visible.\n"
         "  1. accept terms at https://huggingface.co/bioptimus/H-optimus-0\n"
@@ -103,10 +112,13 @@ print("installing openslide + timm ...", flush=True)
 subprocess.run("pip install -q openslide-bin openslide-python timm 2>&1 | tail -2",
                shell=True, check=False)
 
-from huggingface_hub import hf_hub_download
+if not RANDOM_WEIGHTS:
+    from huggingface_hub import hf_hub_download
 
-cfg_file = hf_hub_download("bioptimus/H-optimus-0", "config.json", token=os.environ["HF_TOKEN"])
-print(f"H-optimus-0 reachable ({os.path.getsize(cfg_file)} B)", flush=True)
+    cfg_file = hf_hub_download(
+        "bioptimus/H-optimus-0", "config.json", token=os.environ["HF_TOKEN"]
+    )
+    print(f"H-optimus-0 reachable ({os.path.getsize(cfg_file)} B)", flush=True)
 
 import multiprocessing
 
@@ -139,18 +151,11 @@ if ACCEL is None:
         "Encoding on CPU would take ~400 hours."
     )
 
-# Measured on a real TPU session, not guessed. xla:0 is ONE of eight cores, and
-# every batch pays a synchronous device-to-host transfer whose cost is latency,
-# not bandwidth - so bigger batches barely help (64:114/s, 256:124/s, 512:114/s).
-# At 124 patches/s, 3000 tiles/slide puts the cohort at ~2.9 h, inside one
-# session. 6000 would be ~5.8 h, uncomfortably close to the 9 h cap.
-# 3000 tiles at 0.5 um/px still samples ~37 mm2 of tissue, and training
-# subsamples to a 2048 bag anyway.
-MAX_PATCHES = int(os.environ.get("PATHGRADE_MAX_PATCHES", "3000"))
-BATCH_SIZE = os.environ.get("PATHGRADE_BATCH", "256")
-DECODE_WORKERS = os.environ.get("PATHGRADE_DECODE_WORKERS", "16")
-SLIDE_LIMIT = os.environ.get("PATHGRADE_LIMIT")
-RANDOM_WEIGHTS = os.environ.get("PATHGRADE_RANDOM_WEIGHTS") == "1"
+# Settings measured on a real TPU session, not guessed. xla:0 is ONE of eight
+# cores, and every batch pays a synchronous device-to-host transfer whose cost
+# is latency rather than bandwidth, so larger batches barely help
+# (64:114/s, 256:124/s, 512:114/s). At 124 patches/s, 3000 tiles per slide puts
+# the cohort near 2.9 h - inside one session, where 6000 would be 5.8 h.
 
 # ----------------------------------------------------------- 1. EXTRACTION
 banner("1. EXTRACTION  (GDC -> H-optimus-0 embeddings)")
