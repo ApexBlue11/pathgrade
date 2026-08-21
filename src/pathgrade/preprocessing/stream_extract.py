@@ -161,7 +161,7 @@ class SlidePrefetcher:
             yield item
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_tiles(
     slide,
     grid,

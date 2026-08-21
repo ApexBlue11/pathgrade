@@ -395,3 +395,118 @@ def test_prefetcher_reports_failures_without_consuming_a_slot(monkeypatch, tmp_p
 
     assert ("P1", False) in results
     assert len(results) == 4, "a failure must not stall the queue"
+
+
+# --------------------------------------------------------------------------
+# Inference-tensor regression
+#
+# Every slide failed on TPU with "Cannot set version_counter for inference
+# tensor". Two causes, both here: the normalisation constants were created
+# lazily inside an @torch.inference_mode() forward - making them inference
+# tensors cached on the module - and the scaling used an in-place div_.
+# --------------------------------------------------------------------------
+def _stub_encoder(spec_name="h-optimus-0", monkeypatch=None):
+    """A REAL PatchEncoder, with only the timm backbone swapped for a tiny stub.
+
+    Constructing the genuine object matters: the bug lived in __init__ (or
+    rather in its absence - the constants were built lazily in forward), so a
+    hand-rolled stub would have tested nothing.
+    """
+    import timm
+    import torch.nn as nn
+    from pathgrade.encoders import PatchEncoder, get_spec
+
+    spec = get_spec(spec_name)
+    real_create = timm.create_model
+
+    def tiny(*args, **kwargs):
+        return nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+                             nn.Linear(3, spec.embed_dim))
+
+    timm.create_model = tiny
+    try:
+        return PatchEncoder(spec, device="cpu")
+    finally:
+        timm.create_model = real_create
+
+
+def test_normalisation_constants_are_buffers_not_inference_tensors():
+    """Built in __init__, outside inference mode - this is the actual fix."""
+    enc = _stub_encoder()
+    buffers = dict(enc.named_buffers())
+    assert "_mean" in buffers and "_std" in buffers
+    assert not torch.is_inference(enc._mean)
+    assert not torch.is_inference(enc._std)
+
+
+def test_real_encoder_forward_accepts_uint8_under_inference_mode():
+    """End-to-end reproduction of the TPU failure on CPU."""
+    enc = _stub_encoder()
+    batch = torch.randint(0, 256, (4, 224, 224, 3), dtype=torch.uint8)
+    with torch.inference_mode():
+        out = enc(batch)
+    assert out.shape == (4, enc.spec.embed_dim)
+    assert not torch.is_inference(enc._mean), "constants were poisoned"
+    # A second call must still work; the original bug only bit after caching.
+    assert enc(batch).shape == (4, enc.spec.embed_dim)
+
+
+def test_normalise_survives_being_called_under_inference_mode():
+    """The exact TPU failure: constants must not become inference tensors."""
+    enc = _stub_encoder()
+    x = torch.randint(0, 256, (2, 224, 224, 3), dtype=torch.uint8)
+    with torch.inference_mode():
+        out = enc._normalise(x)
+    assert out.shape == (2, 3, 224, 224)
+    # Constants must survive unpoisoned, so the next call still works.
+    assert not torch.is_inference(enc._mean)
+    again = enc._normalise(torch.randint(0, 256, (1, 224, 224, 3), dtype=torch.uint8))
+    assert again.shape == (1, 3, 224, 224)
+
+
+def test_normalise_does_not_mutate_its_input():
+    """In-place ops are the other half of the inference-tensor trap."""
+    enc = _stub_encoder()
+    x = torch.randint(0, 256, (2, 8, 8, 3), dtype=torch.uint8)
+    before = x.clone()
+    enc._normalise(x)
+    assert torch.equal(x, before)
+
+
+def test_normalise_matches_the_reference_maths():
+    from pathgrade.encoders import get_spec
+
+    enc = _stub_encoder()
+    spec = get_spec("h-optimus-0")
+    x = torch.randint(0, 256, (3, 16, 16, 3), dtype=torch.uint8)
+    expected = (
+        x.permute(0, 3, 1, 2).float() / 255.0
+        - torch.tensor(spec.mean).view(1, 3, 1, 1)
+    ) / torch.tensor(spec.std).view(1, 3, 1, 1)
+    assert torch.allclose(enc._normalise(x), expected, atol=1e-6)
+
+
+def test_encode_tiles_output_is_not_an_inference_tensor(monkeypatch):
+    """encode_tiles must hand back plain arrays usable by anything downstream."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), x % 251, dtype=np.uint8),
+    )
+
+    class Enc:
+        class spec:
+            embed_dim = 4
+            name = "stub"
+        is_xla = False
+
+        def __call__(self, batch):
+            with torch.inference_mode():          # what the real encoder did
+                vals = batch[:, 0, 0, 0].float()
+                return torch.stack([vals] * 4, dim=1)
+
+    feats = se.encode_tiles(object(), _FakeGrid(40), Enc(), lambda t: t,
+                            batch_size=16, num_workers=4, queue_depth=2)
+    assert feats.shape == (40, 4)
+    assert np.isfinite(feats).all()

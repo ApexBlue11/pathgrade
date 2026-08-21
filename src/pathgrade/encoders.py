@@ -214,10 +214,19 @@ class PatchEncoder(nn.Module):
         self.backbone.eval().to(self.device)
         if self.is_xla:
             self.backbone.to(self.dtype)
-        self._mean = None
-        self._std = None
 
-    @torch.inference_mode()
+        # Registered here, outside any inference-mode context. Creating them
+        # lazily inside forward() made them *inference tensors* cached on the
+        # module; XLA then refused to version-count them and every slide failed
+        # with "Cannot set version_counter for inference tensor".
+        self.register_buffer(
+            "_mean", torch.tensor(spec.mean, device=self.device).view(1, 3, 1, 1), persistent=False
+        )
+        self.register_buffer(
+            "_std", torch.tensor(spec.std, device=self.device).view(1, 3, 1, 1), persistent=False
+        )
+
+    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode a batch. Accepts either layout:
 
@@ -243,11 +252,12 @@ class PatchEncoder(nn.Module):
         return out.float()
 
     def _normalise(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, H, W, 3] uint8 -> [B, 3, H, W] normalised float, on device."""
-        if self._mean is None:
-            self._mean = torch.tensor(self.spec.mean, device=self.device).view(1, 3, 1, 1)
-            self._std = torch.tensor(self.spec.std, device=self.device).view(1, 3, 1, 1)
-        x = x.permute(0, 3, 1, 2).float().div_(255.0)
+        """[B, H, W, 3] uint8 -> [B, 3, H, W] normalised float, on device.
+
+        Deliberately free of in-place ops: div_ on a tensor that XLA is tracking
+        is the other half of the inference-tensor failure.
+        """
+        x = x.permute(0, 3, 1, 2).float() / 255.0
         return (x - self._mean) / self._std
 
     def _forward_inner(self, x: torch.Tensor) -> torch.Tensor:
