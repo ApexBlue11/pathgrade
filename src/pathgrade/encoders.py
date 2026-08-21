@@ -130,6 +130,15 @@ REGISTRY: dict[str, EncoderSpec] = {
 
 DEFAULT_ENCODER = "h-optimus-0"
 
+# Architectures matching each encoder width, for --random-weights testing.
+# Widths are what matter: a mismatch corrupts the output buffer downstream.
+RANDOM_ARCH: dict[int, tuple[str, dict]] = {
+    1536: ("vit_giant_patch14_dinov2", {"img_size": 224, "init_values": 1e-5}),
+    2560: ("vit_huge_patch14_224", {}),        # 1280 CLS + 1280 mean = 2560
+    1024: ("vit_large_patch16_224", {}),
+    3072: ("vit_giant_patch14_dinov2", {"img_size": 224, "init_values": 1e-5}),
+}
+
 
 class LicenceError(RuntimeError):
     """Raised when a non-commercial encoder is requested without an explicit opt-in."""
@@ -200,13 +209,18 @@ class PatchEncoder(nn.Module):
         self.dtype = dtype
 
         if random_weights:
-            # Same architecture, no pretrained download. For exercising the
-            # pipeline - tiling, decode, device transfer, IO - without a gated
-            # weight fetch. Embeddings are meaningless; never train on them.
-            arch = {1536: "vit_giant_patch14_224", 2560: "vit_huge_patch14_224",
-                    1024: "vit_large_patch16_224"}.get(spec.embed_dim, "vit_giant_patch14_224")
+            # Same shape, no pretrained download. For exercising the pipeline -
+            # tiling, decode, device transfer, IO - without a gated weight
+            # fetch. Embeddings are meaningless; never train on them.
+            #
+            # The width has to match the real encoder or the output buffer
+            # mismatches. H-optimus-0 is a DINOv2 ViT-g/14 at 1536, which is
+            # NOT timm's vit_giant_patch14_224 (1408).
+            arch, kwargs = RANDOM_ARCH.get(
+                spec.embed_dim, ("vit_giant_patch14_dinov2", {"img_size": 224})
+            )
             print(f"!! RANDOM WEIGHTS ({arch}) - pipeline test only, embeddings are garbage")
-            self.backbone = timm.create_model(arch, pretrained=False, num_classes=0)
+            self.backbone = timm.create_model(arch, pretrained=False, num_classes=0, **kwargs)
         else:
             self.backbone = timm.create_model(
                 spec.hf_hub_id, pretrained=True, num_classes=0, **spec.timm_kwargs
@@ -225,6 +239,22 @@ class PatchEncoder(nn.Module):
         self.register_buffer(
             "_std", torch.tensor(spec.std, device=self.device).view(1, 3, 1, 1), persistent=False
         )
+        self._verify_width()
+
+    def _verify_width(self) -> None:
+        """One probe forward, so a width mismatch fails here and not mid-slide.
+
+        Without this the error surfaces as a numpy broadcast failure deep in
+        encode_tiles, once per slide, with nothing pointing at the cause.
+        """
+        probe = torch.zeros(1, self.spec.patch_px, self.spec.patch_px, 3, dtype=torch.uint8)
+        width = int(self(probe).shape[-1])
+        if width != self.spec.embed_dim:
+            raise RuntimeError(
+                f"encoder {self.spec.name!r} produced width {width} but the registry "
+                f"declares {self.spec.embed_dim}. Fix the registry or the architecture "
+                f"before extracting - a silent width change invalidates saved checkpoints."
+            )
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:

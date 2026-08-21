@@ -510,3 +510,41 @@ def test_encode_tiles_output_is_not_an_inference_tensor(monkeypatch):
                             batch_size=16, num_workers=4, queue_depth=2)
     assert feats.shape == (40, 4)
     assert np.isfinite(feats).all()
+
+
+def test_width_probe_rejects_a_mismatched_architecture():
+    """A wrong-width backbone must fail at construction, not mid-slide.
+
+    Previously this surfaced as a numpy broadcast error inside encode_tiles,
+    once per slide, with nothing naming the cause.
+    """
+    import timm
+    import torch.nn as nn
+    from pathgrade.encoders import PatchEncoder, get_spec
+
+    spec = get_spec("h-optimus-0")               # declares 1536
+    real = timm.create_model
+
+    def wrong_width(*a, **k):
+        return nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(3, 1408))
+
+    timm.create_model = wrong_width
+    try:
+        with pytest.raises(RuntimeError, match="produced width 1408.*declares 1536"):
+            PatchEncoder(spec, device="cpu")
+    finally:
+        timm.create_model = real
+
+
+def test_width_probe_accepts_a_matching_architecture():
+    enc = _stub_encoder()                        # stub is built at spec width
+    assert enc.spec.embed_dim == 1536
+
+
+@pytest.mark.parametrize("dim", [1536, 2560, 1024, 3072])
+def test_random_arch_table_covers_every_registry_width(dim):
+    from pathgrade.encoders import RANDOM_ARCH, REGISTRY
+
+    widths = {s.embed_dim for s in REGISTRY.values()}
+    assert widths <= set(RANDOM_ARCH), f"uncovered widths: {widths - set(RANDOM_ARCH)}"
+    assert dim in RANDOM_ARCH
