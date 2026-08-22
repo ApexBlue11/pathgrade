@@ -41,8 +41,34 @@ for d in (OUT, RELEASE, CACHE):
     d.mkdir(parents=True, exist_ok=True)
 
 
+# Every diagnostic kernel in this repo writes an fsync'd trail, and every one of
+# them was debuggable. This kernel only printed, and it is the single one whose
+# failures could never be explained. Kaggle's log endpoint has returned empty
+# even for runs that finished successfully, so stdout is not a record. The trail
+# starts at line one, so any future failure names the last step that began.
+TRAIL = WORK / "pipeline_trail.txt"
+with open(TRAIL, "w"):
+    pass
+
+
+def trail(step: str, detail: str = "") -> None:
+    line = f"[{time.time() - T0:8.1f}s] {step} {detail}".rstrip()
+    print(line, flush=True)
+    try:
+        with open(TRAIL, "a") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
 def banner(text):
     print(f"\n{'=' * 70}\n{text}\n{'=' * 70}", flush=True)
+    trail("STAGE", text)
+
+
+trail("BOOT", f"python {sys.version.split()[0]}")
 
 
 def find_src(marker="src/pathgrade/__init__.py", root="/kaggle/input"):
@@ -62,6 +88,7 @@ RANDOM_WEIGHTS = os.environ.get("PATHGRADE_RANDOM_WEIGHTS") == "1"
 
 SRC = find_src()
 if SRC is None:
+    trail("FATAL", "pathgrade-src dataset not mounted")
     sys.exit("FATAL: pathgrade-src dataset not mounted")
 sys.path.insert(0, f"{SRC}/src")
 print(f"source: {SRC}", flush=True)
@@ -145,6 +172,7 @@ except Exception as e:
 # hours. Far better to fail in ten seconds than to look busy for a whole
 # session and produce nothing.
 if ACCEL is None:
+    trail("FATAL", "no accelerator - notebook is set to CPU")
     sys.exit(
         "FATAL: no accelerator. This notebook is set to CPU. "
         "Settings > Accelerator > TPU VM, then Save & Run All. "
@@ -194,6 +222,7 @@ extracted = sorted(p.stem for p in OUT.glob("*.h5"))
 print(f"\nextraction finished: {len(extracted)} slides, exit={extract_code}", flush=True)
 
 if not extracted:
+    trail("FATAL", "no features extracted, nothing to train on")
     sys.exit("FATAL: no features extracted, nothing to train on")
 
 # ------------------------------------------------------------- 2. TRAINING
@@ -323,8 +352,9 @@ try:
           f"CI {test_result['metrics']['qwk_ci95']}")
     print(f"release          : {sorted(p.name for p in RELEASE.iterdir())}", flush=True)
 
-except Exception:
+except BaseException:
     # The embeddings above cost hours; never let a training bug discard them.
+    trail("TRAINING_FAILED", "embeddings preserved")
     banner("TRAINING FAILED - embeddings preserved")
     traceback.print_exc()
     with open(WORK / "TRAINING_FAILED.txt", "w") as f:
