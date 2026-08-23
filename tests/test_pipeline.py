@@ -367,7 +367,11 @@ def test_prefetcher_bounds_slides_on_disk(monkeypatch, tmp_path):
             on_disk -= 1
         pf.release()
 
-    assert seen == [r.patient_id for r in records], "slides must arrive in order"
+    # Delivery order is deliberately NOT guaranteed any more: results are
+    # yielded as downloads complete so a slow one cannot block slides already
+    # on disk. Completeness is what matters - slides are independent and each
+    # writes its own file.
+    assert sorted(seen) == sorted(r.patient_id for r in records), "every slide exactly once"
     assert peak <= 3, f"peak {peak} slides on disk exceeded max_on_disk=3"
     assert peak > 1, "downloads should overlap, not serialise"
 
@@ -803,3 +807,112 @@ def test_build_encoders_refuses_to_thread_across_xla_devices(monkeypatch):
     forced = enc_mod.build_encoders(enc_mod.get_spec("h-optimus-0"),
                                     device=torch.device("xla:0"), max_devices=8)
     assert len(forced) == 8, "explicit override must still work"
+
+
+# --------------------------------------------------------------------------
+# Prefetcher: a completed download must not wait behind a slow one
+#
+# Measured on a real 79-slide chunk: 2142 s of per-slide work against a 3158 s
+# wall. Download times are skewed (median 16 s, max 63 s), and in-order
+# delivery stalled the encoder behind the slowest one while other slides sat
+# finished on disk. Slides are independent, so that ordering was pure cost.
+# --------------------------------------------------------------------------
+def test_prefetcher_delivers_out_of_order_when_one_download_is_slow(monkeypatch, tmp_path):
+    """A fast slide must overtake a slow one instead of queueing behind it."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    def fake_download(record, cache_dir):
+        time.sleep(0.60 if record.patient_id == "P0" else 0.02)
+        p = Path(cache_dir) / record.file_name
+        p.write_bytes(b"x")
+        return p
+
+    monkeypatch.setattr(se, "download_slide", fake_download)
+    records = [SlideRecord(f"id{i}", f"S{i}.svs", 100, f"P{i}") for i in range(6)]
+
+    pf = se.SlidePrefetcher(records, tmp_path, max_on_disk=6, workers=6).start()
+    order = []
+    for record, path, _info in pf:
+        order.append(record.patient_id)
+        Path(path).unlink(missing_ok=True)
+        pf.release()
+
+    assert sorted(order) == sorted(r.patient_id for r in records), "every slide exactly once"
+    assert order[-1] == "P0", "the slow download must not block the five fast ones"
+
+
+def test_prefetcher_out_of_order_still_bounds_disk(monkeypatch, tmp_path):
+    """Yielding as-completed must not loosen the slides-on-disk budget."""
+    from pathgrade.preprocessing import stream_extract as se
+    import threading as _t
+
+    live = peak = 0
+    lock = _t.Lock()
+
+    def fake_download(record, cache_dir):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.02)
+        p = Path(cache_dir) / record.file_name
+        p.write_bytes(b"x")
+        return p
+
+    monkeypatch.setattr(se, "download_slide", fake_download)
+    records = [SlideRecord(f"id{i}", f"S{i}.svs", 100, f"P{i}") for i in range(20)]
+
+    pf = se.SlidePrefetcher(records, tmp_path, max_on_disk=3, workers=8).start()
+    seen = 0
+    for record, path, _info in pf:
+        seen += 1
+        Path(path).unlink(missing_ok=True)
+        with lock:
+            live -= 1
+        pf.release()
+
+    assert seen == 20
+    assert peak <= 3, f"peak {peak} in flight exceeds max_on_disk=3"
+    assert peak > 1, "downloads should still overlap"
+
+
+# --------------------------------------------------------------------------
+# Multi-process extraction: one process per XLA device
+#
+# spawn() itself needs a TPU, but the argument wiring decides which slides each
+# process claims - and getting that wrong would silently make eight processes
+# extract the same shard, or skip slides entirely.
+# --------------------------------------------------------------------------
+def test_multi_extract_worker_claims_its_own_shard(monkeypatch):
+    from pathgrade.preprocessing import multi_extract as me
+
+    seen = {}
+
+    def fake_run(args):
+        seen[args.shard] = (args.num_shards, args.device, args.tpu_cores,
+                            args.out_dir, args.max_patches)
+        return 0
+
+    monkeypatch.setattr("pathgrade.preprocessing.stream_extract.run", fake_run)
+    argv = ["--out-dir", "/tmp/f", "--max-patches", "3000", "--shard", "0", "--num-shards", "1"]
+    for i in range(8):
+        me._worker(i, argv, 8)
+
+    assert sorted(seen) == list(range(8)), "each process must take a distinct shard"
+    for shard, (n, dev, cores, out, mp) in seen.items():
+        assert n == 8, "num_shards must be overridden to the process count"
+        assert dev == "xla"
+        assert cores == 1, "threading across devices is broken; workers must use 1"
+        assert out == "/tmp/f" and mp == 3000, "other args must pass through intact"
+
+
+def test_multi_extract_worker_survives_a_dead_shard(monkeypatch, capsys):
+    """One shard failing must not abort the others - the rest still hold slides."""
+    from pathgrade.preprocessing import multi_extract as me
+
+    def boom(args):
+        raise RuntimeError("device fell over")
+
+    monkeypatch.setattr("pathgrade.preprocessing.stream_extract.run", boom)
+    me._worker(3, ["--out-dir", "/tmp/f"], 8)      # must not raise
+    assert "shard 3" in capsys.readouterr().out

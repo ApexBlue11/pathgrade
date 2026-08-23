@@ -97,6 +97,11 @@ DECODE_WORKERS = os.environ.get("PATHGRADE_DECODE_WORKERS", "16")
 # build_encoders also refuses to replicate on XLA. Real 8-way parallelism needs
 # one process per device, which is a separate change.
 TPU_CORES = os.environ.get("PATHGRADE_TPU_CORES", "1")
+# Processes to spawn, one per XLA device. This is the route that actually uses
+# a v5e-8: threads share one process and corrupt each other's graphs, separate
+# processes each own a chip. 8 processes x 16 decode threads also puts 128 of
+# the 224 vCPU to work instead of 16.
+NPROCS = os.environ.get("PATHGRADE_NPROCS", "8")
 # 4 streams (143 MB/s measured) against a single-device pipeline that consumes
 # ~24 MB/s of slides end to end - already 6x over-provisioned, so raising this
 # buys nothing today and would only be unmeasured risk. It becomes the binding
@@ -317,7 +322,7 @@ extract_argv = [
     "--prefetch", PREFETCH,
     "--decode-workers", DECODE_WORKERS,
     "--tpu-cores", TPU_CORES,
-    "--max-hours", MAX_EXTRACT_HOURS,
+    "--max-hours", "__BUDGET__",   # substituted per attempt with time remaining
     "--min-free-gb", "4",
     "--notify-every", "25",
 ]
@@ -380,29 +385,72 @@ print("argv:", " ".join(a for a in extract_argv if not a.startswith("http")), fl
 # slide already written, records how the child died - including the signal, so
 # a segfault is distinguishable from an exception - and still trains and
 # commits output. stdout is inherited, so per-slide progress still streams.
-extract_code, extract_error = None, None
-child = [sys.executable, "-u", "-m", "pathgrade.preprocessing.stream_extract"] + extract_argv
-child_env = {**os.environ, "PYTHONPATH": f"{SRC}/src"}
-trail("STEP", f"extraction subprocess, {len(extract_argv)} args")
-try:
-    extract_code = subprocess.run(child, env=child_env).returncode
-    if extract_code is not None and extract_code < 0:
-        # Negative means killed by a signal: -11 SIGSEGV, -9 SIGKILL (the OOM
-        # killer). Resolving the name is best-effort - not every signal number
-        # is in the enum on every platform, and raising here, inside the
-        # handler for a crash, would lose the very information we came for.
-        try:
-            import signal as _sig
+child_env = {**os.environ, "PYTHONPATH": f"{SRC}/src", "PATHGRADE_NPROCS": NPROCS}
+T_EXTRACT = time.time()
 
-            name = _sig.Signals(-extract_code).name
-        except (ValueError, ImportError):
-            name = "unknown signal"
-        extract_error = f"extraction child killed by {name} ({extract_code})"
-    elif extract_code not in (0, 1):
-        # 1 is the documented "finished, but some slides failed" return.
-        extract_error = f"extraction child exited {extract_code}"
-except BaseException:
-    extract_error = traceback.format_exc()
+
+def budget_left() -> float:
+    """Hours still available to extraction, shared across attempts.
+
+    Both attempts draw on one budget. Without this a failed multi-device try
+    that burned the whole allowance would be followed by a single-device pass
+    with a *fresh* allowance, doubling the chunk length and pushing it into the
+    window where containers have been killed.
+    """
+    return max(0.02, float(MAX_EXTRACT_HOURS) - (time.time() - T_EXTRACT) / 3600)
+
+
+def run_extraction(module: str, label: str):
+    """Run one extraction attempt as a child. Returns (error_or_None, n_slides)."""
+    argv = [a if a != "__BUDGET__" else f"{budget_left():.3f}" for a in extract_argv]
+    cmd = [sys.executable, "-u", "-m", module] + argv
+    trail("STEP", f"{label} extraction, budget {budget_left():.2f} h")
+    err = None
+    try:
+        rc = subprocess.run(cmd, env=child_env).returncode
+        if rc is not None and rc < 0:
+            # Negative means killed by a signal: -11 SIGSEGV, -9 SIGKILL (the
+            # OOM killer). Resolving the name is best-effort - not every signal
+            # number is in the enum on every platform, and raising here, inside
+            # the handler for a crash, would lose the information we came for.
+            try:
+                import signal as _sig
+
+                name = _sig.Signals(-rc).name
+            except (ValueError, ImportError):
+                name = "unknown signal"
+            err = f"{label} child killed by {name} ({rc})"
+        elif rc not in (0, 1):
+            # 1 is the documented "finished, but some slides failed" return.
+            err = f"{label} child exited {rc}"
+    except BaseException:
+        err = traceback.format_exc()
+    n = len(list(OUT.glob("*.h5")))
+    trail("EXTRACT", f"{label} -> {n} slides total{', ERR: ' + err if err else ''}")
+    return err, n
+
+
+# Prefer one process per TPU device; fall back to the proven single-device
+# path. Threading across devices is broken (see multi_extract), but eight
+# separate processes each owning one device is the supported arrangement and
+# is worth ~8x on the stage that is 89% of per-slide time.
+#
+# The fallback is what makes trying this safe at all: extraction is idempotent,
+# so a multi-device attempt that dies having written nothing costs only the
+# minutes it ran, and the single-device pass then does the chunk as before.
+extract_code, extract_error = None, None
+before = len(list(OUT.glob("*.h5")))
+if int(NPROCS) > 1 and ACCEL == "xla":
+    extract_error, after = run_extraction(
+        "pathgrade.preprocessing.multi_extract", f"{NPROCS}-process")
+    if after <= before:
+        trail("FALLBACK", f"{NPROCS}-process added nothing; reverting to single device")
+        banner("MULTI-DEVICE ADDED NOTHING - falling back to single device")
+        extract_error, after = run_extraction(
+            "pathgrade.preprocessing.stream_extract", "single-device")
+else:
+    extract_error, after = run_extraction(
+        "pathgrade.preprocessing.stream_extract", "single-device")
 
 if extract_error:
     trail("EXTRACTION_FAILED", extract_error.strip().splitlines()[-1][:200])
@@ -439,7 +487,11 @@ try:
     import collections
     import csv
 
-    torch.set_num_threads(min(32, multiprocessing.cpu_count()))
+    # UNVERIFIED tuning: the box has 224 vCPU and training is only ~5% of total
+    # wall clock, so this is not where "fastest overall" is won. A 530K-param
+    # head can also lose to thread-sync overhead, which is why this is raised
+    # to 64 rather than 224.
+    torch.set_num_threads(min(64, multiprocessing.cpu_count()))
 
     from pathgrade.config import Config
     from pathgrade.data.io import verify_cohort
@@ -477,7 +529,7 @@ try:
     cfg.data.feature_dir = str(OUT)
     cfg.data.labels_csv = str(subset_csv)
     cfg.data.splits_path = str(splits_path)
-    cfg.optim.num_workers = 8
+    cfg.optim.num_workers = 16     # features are RAM-cached; this is cheap
     cfg.optim.amp = False
     summary = run_cv(cfg)
 

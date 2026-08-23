@@ -124,33 +124,51 @@ class SlidePrefetcher:
         """Producer. Acquires each disk slot *before* submitting, in record order.
 
         Acquiring inside the worker instead would deadlock: freed threads pick
-        up later records, those grab the released slots, and the consumer - which
-        must take results in order - waits forever on an earlier record that can
-        no longer get a slot. Reserving in submission order makes the in-flight
-        set always the earliest unconsumed records, so progress is guaranteed.
+        up later records, those grab the released slots, and the consumer waits
+        forever on an earlier record that can no longer get a slot. Reserving in
+        submission order keeps the in-flight set bounded and progress guaranteed.
+
+        Results are delivered **as they complete, not in record order**, and
+        that is worth a third of extraction wall clock. Measured on a 79-slide
+        chunk: 2142 s of actual per-slide work against a 3158 s wall. Download
+        durations are heavily skewed (median 16 s, max 63 s), and popping the
+        oldest future blocked the encoder behind the single slowest download
+        even when three other slides were already sitting on disk. Slides are
+        independent - each writes its own file - so ordering buys nothing.
         """
-        pending: deque = deque()
+        from concurrent.futures import FIRST_COMPLETED
+        from concurrent.futures import wait as futures_wait
+
+        pending: set = set()
         records = iter(self.records)
+
+        def submit_next(pool) -> bool:
+            record = next(records, None)
+            if record is None:
+                return False
+            self._slots.acquire()           # blocks until the consumer frees disk
+            if self._stop.is_set():
+                self._slots.release()
+                return False
+            pending.add(pool.submit(self._fetch, record))
+            return True
+
         try:
             with ThreadPoolExecutor(max_workers=self.workers) as pool:
                 for _ in range(self.max_on_disk):
-                    record = next(records, None)
-                    if record is None:
+                    if not submit_next(pool):
                         break
-                    self._slots.acquire()
-                    pending.append(pool.submit(self._fetch, record))
 
                 while pending:
-                    self.queue.put(pending.popleft().result())
+                    done, _ = futures_wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        pending.discard(future)
+                        self.queue.put(future.result())
                     if self._stop.is_set():
                         break
-                    record = next(records, None)
-                    if record is None:
-                        continue
-                    self._slots.acquire()   # blocks until the consumer frees disk
-                    if self._stop.is_set():
-                        break
-                    pending.append(pool.submit(self._fetch, record))
+                    for _ in range(len(done)):
+                        if not submit_next(pool):
+                            break
         finally:
             self.queue.put(None)            # sentinel
 
