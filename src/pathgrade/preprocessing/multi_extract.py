@@ -29,6 +29,7 @@ slide is independent.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -109,20 +110,50 @@ def main(argv=None) -> int:
     # chips for the parent's lifetime and leave nothing for the children.
     import torch_xla.distributed.xla_multiprocessing as xmp
 
+    # The TPU topology environment decides whether multiprocess is even
+    # possible, and on Kaggle it is pre-set. Children died with
+    #   Could not find SliceBuilder port 8476 in any of the 0 ports provided
+    #   in `tpu_process_addresses`="local"
+    # which is libtpu in single-process mode being asked to run eight. Print
+    # what is actually set before touching it - three attempts have now been
+    # spent guessing at this layer.
+    tpu_env = {k: v for k, v in sorted(os.environ.items())
+               if k.startswith(("TPU_", "PJRT_", "XLA_", "CLOUD_TPU", "LIBTPU"))}
+    print(f"TPU env before spawn: {json.dumps(tpu_env)}", flush=True)
+
+    # torch_xla configures the multiprocess topology itself, but only for keys
+    # it does not find already set. Kaggle's single-process defaults therefore
+    # win and leave the children with nowhere to bind. Clear them and let
+    # torch_xla derive the eight-way layout from scratch.
+    if os.environ.get("PATHGRADE_CLEAR_TPU_ENV", "1") == "1":
+        for key in ("TPU_PROCESS_ADDRESSES", "TPU_VISIBLE_CHIPS",
+                    "TPU_VISIBLE_DEVICES", "TPU_PROCESS_BOUNDS",
+                    "TPU_CHIPS_PER_PROCESS_BOUNDS", "CLOUD_TPU_TASK_ID",
+                    "TPU_HOST_BOUNDS", "TPU_WORKER_ID", "TPU_WORKER_HOSTNAMES"):
+            if key in os.environ:
+                print(f"  clearing {key}={os.environ[key]!r}", flush=True)
+                os.environ.pop(key, None)
+
     # Two constraints, both learned from real runs rather than documentation.
     #
     # nprocs MUST be None. An explicit count is rejected outright:
     #   ValueError: Unsupported nprocs (8). Please use nprocs=1 or None
     #   (default). If None, spawn will use all available devices.
     #
-    # start_method MUST be "spawn", not the default fork. Determining the
-    # device count initialises the XLA computation client in this process, and
-    # forked children inherit that state, so every one of the eight died with
+    # start_method is "spawn" rather than the default fork. CORRECTION: this
+    # was first added believing forked children inherited an already-
+    # initialised computation client, because all eight died with
     #   F runtime.cpp:21] Check failed: !g_computation_client_initialized
     #   InitializeComputationClient() can only be called once.
-    # A fresh interpreter per child starts with that flag clear. This is safe
-    # only because _worker lives in an importable library module: "spawn"
-    # re-imports the entry module in each child (as __mp_main__, so the
+    # That hypothesis was WRONG - the same failure occurred with "spawn". The
+    # stack trace names PrepareToExit(), so that check fires during teardown of
+    # a child that never initialised successfully; the real error is the
+    # SliceBuilder/tpu_process_addresses one above. "spawn" is kept because a
+    # fresh interpreter is the cleaner arrangement, not because it fixed
+    # anything.
+    #
+    # It is safe only because _worker lives in an importable library module:
+    # "spawn" re-imports the entry module in each child (as __mp_main__, so the
     # __main__ guard does not re-fire), which would be catastrophic if the
     # entry point were the Kaggle kernel script.
     print("spawning one process per available XLA device", flush=True)
