@@ -894,9 +894,11 @@ def test_multi_extract_worker_claims_its_own_shard(monkeypatch):
         return 0
 
     monkeypatch.setattr("pathgrade.preprocessing.stream_extract.run", fake_run)
+    # off TPU the runtime lookup fails, so the worker falls back to this
+    monkeypatch.setenv("PATHGRADE_NPROCS", "8")
     argv = ["--out-dir", "/tmp/f", "--max-patches", "3000", "--shard", "0", "--num-shards", "1"]
     for i in range(8):
-        me._worker(i, argv, 8)
+        me._worker(i, argv)
 
     assert sorted(seen) == list(range(8)), "each process must take a distinct shard"
     for shard, (n, dev, cores, out, mp) in seen.items():
@@ -914,5 +916,5 @@ def test_multi_extract_worker_survives_a_dead_shard(monkeypatch, capsys):
         raise RuntimeError("device fell over")
 
     monkeypatch.setattr("pathgrade.preprocessing.stream_extract.run", boom)
-    me._worker(3, ["--out-dir", "/tmp/f"], 8)      # must not raise
+    me._worker(3, ["--out-dir", "/tmp/f"])         # must not raise
     assert "shard 3" in capsys.readouterr().out

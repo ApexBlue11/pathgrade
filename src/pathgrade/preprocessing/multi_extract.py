@@ -34,16 +34,38 @@ import sys
 import time
 
 
-def _worker(index: int, argv: list[str], num_shards: int) -> None:
-    """One process, one XLA device, one shard of the slide list."""
+def _world() -> tuple[int | None, int | None]:
+    """(ordinal, world size) from the XLA runtime, or (None, None) off TPU."""
+    try:
+        import torch_xla.runtime as xr
+
+        return xr.global_ordinal(), xr.world_size()
+    except Exception:
+        return None, None
+
+
+def _worker(index: int, argv: list[str]) -> None:
+    """One process, one XLA device, one shard of the slide list.
+
+    The shard count is read from the runtime rather than passed in, because
+    ``spawn`` is called with ``nprocs=None`` - torch_xla rejects an explicit
+    count outright ("Unsupported nprocs (8). Please use nprocs=1 or None") and
+    decides the device count itself. Guessing it here would silently mis-split
+    the cohort if the runtime disagreed.
+    """
     from .stream_extract import build_parser, run
 
+    ordinal, world = _world()
+    shard = index if ordinal is None else ordinal
+    num_shards = world or int(os.environ.get("PATHGRADE_NPROCS", "8"))
+
     args = build_parser().parse_args(list(argv))
-    args.shard = index
+    args.shard = shard
     args.num_shards = num_shards
     args.device = "xla"
     args.tpu_cores = 1          # threading across devices is broken; never here
-    print(f"[shard {index}/{num_shards}] starting", flush=True)
+    index = shard
+    print(f"[shard {shard}/{num_shards}] starting", flush=True)
     try:
         run(args)
     except BaseException as e:                      # noqa: BLE001
@@ -78,17 +100,21 @@ def main(argv=None) -> int:
     from .stream_extract import build_parser
 
     args = build_parser().parse_args(argv)        # validate before spawning
-    nprocs = int(os.environ.get("PATHGRADE_NPROCS", "8"))
 
     if not args.random_weights:
         secs = prewarm(args.encoder)
-        print(f"encoder cached in {secs:.0f}s; spawning {nprocs} processes", flush=True)
+        print(f"encoder cached in {secs:.0f}s", flush=True)
 
     # Import only now. Touching torch_xla in the parent would claim the TPU
     # chips for the parent's lifetime and leave nothing for the children.
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    xmp.spawn(_worker, args=(argv, nprocs), nprocs=nprocs)
+    # nprocs MUST be None. An explicit count is rejected outright:
+    #   ValueError: Unsupported nprocs (8). Please use nprocs=1 or None
+    #   (default). If None, spawn will use all available devices.
+    # To cap it, set TPU_NUM_DEVICES in the environment instead.
+    print("spawning one process per available XLA device", flush=True)
+    xmp.spawn(_worker, args=(argv,), nprocs=None)
     return 0
 
 
