@@ -19,8 +19,12 @@ Two failure properties matter here, because the expensive half runs first:
 Output is flushed aggressively so `kaggle kernels logs` is useful while the run
 is still going, instead of only after it ends.
 
-RUN FROM THE KAGGLE UI. An API-pushed kernel does not inherit UI-attached
-secrets, so HF_TOKEN would be invisible and the gated encoder would 401.
+The HF token arrives as a file in the attached ``apexblue/pathgrade-token``
+dataset, not as a UI secret. That matters: an API-pushed kernel is not given
+the secrets service at all, so a UI-attached ``HF_TOKEN`` is invisible to it
+and the gated encoder 401s. Reading the token from a private dataset makes the
+whole run launchable with ``kaggle kernels push``, with no human in the loop.
+The UI secret still works and is still tried, just second.
 """
 import glob
 import json
@@ -82,7 +86,32 @@ def find_src(marker="src/pathgrade/__init__.py", root="/kaggle/input"):
 banner("0. PREFLIGHT")
 MAX_PATCHES = int(os.environ.get("PATHGRADE_MAX_PATCHES", "3000"))
 BATCH_SIZE = os.environ.get("PATHGRADE_BATCH", "256")
+# 16 is the proven value. Decode was never the bottleneck: real slides run
+# 1900-2500 tiles/s against an encoder that consumes 123/s on one device, and
+# oversubscription measurably hurts. Raise this only alongside real
+# multi-device encoding.
 DECODE_WORKERS = os.environ.get("PATHGRADE_DECODE_WORKERS", "16")
+# XLA devices to encode across, via threads. MEASURED BROKEN above 2: on a
+# v5e-8, 7 of 8 threads died in SyncLiveTensorsGraph and the survivors made the
+# job SLOWER than one device (68 vs 123 patches/s). Left at 1 deliberately;
+# build_encoders also refuses to replicate on XLA. Real 8-way parallelism needs
+# one process per device, which is a separate change.
+TPU_CORES = os.environ.get("PATHGRADE_TPU_CORES", "1")
+# 4 streams (143 MB/s measured) against a single-device pipeline that consumes
+# ~24 MB/s of slides end to end - already 6x over-provisioned, so raising this
+# buys nothing today and would only be unmeasured risk. It becomes the binding
+# constraint only once encoding is genuinely 8-way parallel; both are env-
+# tunable for that run. Raising --download-workers alone does nothing: the
+# prefetcher's semaphore counts slides on disk, so --prefetch must rise too.
+DOWNLOAD_WORKERS = os.environ.get("PATHGRADE_DOWNLOAD_WORKERS", "4")
+PREFETCH = os.environ.get("PATHGRADE_PREFETCH", "4")
+# Wall-clock budget for extraction. Deliberately short by default: the two
+# runs that tried to do the whole cohort in one session were killed outright
+# (86 min, 3 h 45) and lost everything, while a 34-minute run committed fine.
+# Stopping cleanly well inside that window is what makes progress durable, and
+# the seeding step above makes the next run continue where this one stopped.
+MAX_EXTRACT_HOURS = os.environ.get("PATHGRADE_MAX_EXTRACT_HOURS", "0.85")
+SKIP_TRAIN = os.environ.get("PATHGRADE_SKIP_TRAIN") == "1"
 SLIDE_LIMIT = os.environ.get("PATHGRADE_LIMIT")
 RANDOM_WEIGHTS = os.environ.get("PATHGRADE_RANDOM_WEIGHTS") == "1"
 
@@ -94,45 +123,72 @@ sys.path.insert(0, f"{SRC}/src")
 print(f"source: {SRC}", flush=True)
 
 
-def load_token():
+def _adopt(value: str, source: str) -> str:
+    os.environ["HF_TOKEN"] = value
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = value
+    return source
+
+
+def load_token(why: dict):
+    """Find an HF token, recording *why* each route failed.
+
+    Route order is deliberate. The attached-dataset file comes before Kaggle
+    secrets because it is the only route that works for an API-pushed kernel -
+    the secrets service is not provisioned for one at all, and asking it first
+    just buys a slow ConnectionError on the path we now use by default.
+
+    ``why`` is filled in rather than discarded. The previous version bound the
+    exception to a local named ``last`` and never read it, so the one run that
+    failed here could not be diagnosed from its own output.
+    """
     for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         if os.environ.get(var):
             return f"env:{var}"
+
+    hits = glob.glob("/kaggle/input/**/hf_token.txt", recursive=True)
+    why["files_seen"] = hits
+    for path in hits:
+        try:
+            value = open(path).read().strip()
+            if value:
+                return _adopt(value, f"file:{path}")
+            why[f"file:{path}"] = "empty"
+        except OSError as e:
+            why[f"file:{path}"] = f"{type(e).__name__}: {e}"
+
     try:
         from kaggle_secrets import UserSecretsClient
+
         client = UserSecretsClient()
         for key in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
             try:
                 value = client.get_secret(key)
                 if value:
-                    os.environ["HF_TOKEN"] = value
-                    os.environ["HUGGING_FACE_HUB_TOKEN"] = value
-                    return f"kaggle-secret:{key}"
+                    return _adopt(value, f"kaggle-secret:{key}")
             except Exception as e:
-                last = e
+                why[f"secret:{key}"] = f"{type(e).__name__}: {e}"
     except Exception as e:
-        last = e
-    for path in glob.glob("/kaggle/input/**/hf_token.txt", recursive=True):
-        value = open(path).read().strip()
-        if value:
-            os.environ["HF_TOKEN"] = value
-            os.environ["HUGGING_FACE_HUB_TOKEN"] = value
-            return f"file:{path}"
+        why["secrets_import"] = f"{type(e).__name__}: {e}"
     return None
 
 
-token_source = load_token()
+token_why: dict = {}
+token_source = load_token(token_why)
 print(f"HF token: {token_source or 'NOT FOUND'}", flush=True)
+trail("TOKEN", token_source or f"NOT FOUND {json.dumps(token_why)[:300]}")
 if RANDOM_WEIGHTS and token_source is None:
     # Rehearsal mode never downloads weights, so a token would be pointless.
     print("REHEARSAL: no token needed (random weights)", flush=True)
 elif token_source is None:
+    for k, v in token_why.items():
+        print(f"  {k}: {v}", file=sys.stderr)
+    trail("FATAL", "no HF token by any route")
     sys.exit(
         "FATAL: no HF token visible.\n"
         "  1. accept terms at https://huggingface.co/bioptimus/H-optimus-0\n"
-        "  2. create a read token at https://huggingface.co/settings/tokens\n"
-        "  3. in THIS notebook: Add-ons > Secrets > add HF_TOKEN and tick it\n"
-        "  4. Save & Run All from the UI - an API push cannot see secrets"
+        "  2. attach the apexblue/pathgrade-token dataset (contains hf_token.txt),\n"
+        "     which is the route that works for an API-pushed kernel\n"
+        "  3. or, for a UI run: Add-ons > Secrets > add HF_TOKEN and tick it"
     )
 
 print("installing openslide + timm ...", flush=True)
@@ -140,12 +196,26 @@ subprocess.run("pip install -q openslide-bin openslide-python timm 2>&1 | tail -
                shell=True, check=False)
 
 if not RANDOM_WEIGHTS:
+    # Cheap gate on the gated repo: a 401 here costs seconds, whereas finding
+    # out at the first slide costs the download that preceded it. This was the
+    # one preflight check that could fail without leaving a trail entry.
     from huggingface_hub import hf_hub_download
 
-    cfg_file = hf_hub_download(
-        "bioptimus/H-optimus-0", "config.json", token=os.environ["HF_TOKEN"]
-    )
+    trail("STEP", "probing gated repo bioptimus/H-optimus-0")
+    try:
+        cfg_file = hf_hub_download(
+            "bioptimus/H-optimus-0", "config.json", token=os.environ["HF_TOKEN"]
+        )
+    except Exception as e:
+        trail("FATAL", f"H-optimus-0 unreachable: {type(e).__name__}: {e}")
+        sys.exit(
+            f"FATAL: cannot reach bioptimus/H-optimus-0 ({type(e).__name__}: {e}).\n"
+            "  The token was found, so this is almost certainly the gate: accept the\n"
+            "  terms at https://huggingface.co/bioptimus/H-optimus-0 with the same\n"
+            "  account that issued the token."
+        )
     print(f"H-optimus-0 reachable ({os.path.getsize(cfg_file)} B)", flush=True)
+    trail("OK", "H-optimus-0 reachable")
 
 import multiprocessing
 
@@ -156,16 +226,28 @@ print(f"vCPU {multiprocessing.cpu_count()}")
 for path in ("/kaggle/working", "/kaggle/tmp"):
     if os.path.isdir(path):
         print(f"{path:16s} {shutil.disk_usage(path)[2] / 1e9:7.1f} GB free")
+# The accelerator probe runs in a THROWAWAY subprocess, and that detail is
+# load-bearing. Creating an XLA device claims the TPU chips for the lifetime of
+# the process that created them, so a parent that calls xm.xla_device() makes it
+# impossible for a child to acquire the TPU afterwards. Extraction is run as a
+# child (see stage 1), so the parent must never touch a device itself - it only
+# asks a short-lived process whether one exists, and that process frees the
+# chips when it exits.
 ACCEL = None
-try:
-    import torch_xla.core.xla_model as xm
-    print(f"XLA: {xm.xla_device()}", flush=True)
+_probe = subprocess.run(
+    [sys.executable, "-c",
+     "import torch_xla.core.xla_model as xm; print(xm.xla_device())"],
+    capture_output=True, text=True, timeout=600,
+)
+if _probe.returncode == 0 and "xla" in _probe.stdout:
     ACCEL = "xla"
-except Exception as e:
-    print(f"no XLA ({e})", flush=True)
+    print(f"XLA: {_probe.stdout.strip()} (probed out-of-process)", flush=True)
+else:
+    print(f"no XLA (rc={_probe.returncode}) {_probe.stderr.strip()[-300:]}", flush=True)
     if torch.cuda.is_available():
         ACCEL = "cuda"
         print(f"CUDA: {torch.cuda.get_device_name(0)}", flush=True)
+trail("ACCEL", str(ACCEL))
 
 # Refuse to encode on a bare CPU session. H-optimus-0 is a 1B-parameter ViT-g;
 # it runs at ~0.4 patches/s on CPU, so 435 slides would take several hundred
@@ -179,18 +261,48 @@ if ACCEL is None:
         "Encoding on CPU would take ~400 hours."
     )
 
-# Settings measured on a real TPU session, not guessed. xla:0 is ONE of eight
-# cores, and every batch pays a synchronous device-to-host transfer whose cost
-# is latency rather than bandwidth, so larger batches barely help
-# (64:114/s, 256:124/s, 512:114/s). At 124 patches/s, 3000 tiles per slide puts
-# the cohort near 2.9 h - inside one session, where 6000 would be 5.8 h.
+# Settings measured on a real TPU session, not guessed. Every batch pays a
+# synchronous device-to-host transfer whose cost is latency rather than
+# bandwidth, so larger batches barely help (64:114/s, 256:124/s, 512:114/s).
+#
+# 124 patches/s is ONE device. A v5e-8 has eight, and --tpu-cores now spreads
+# replicas across all of them; the encoder is frozen, so the replicas are
+# independent and need no collectives. If replication fails at runtime,
+# build_encoders falls back to however many it managed, down to one - the
+# path validated on 60 real slides.
 
 # ----------------------------------------------------------- 1. EXTRACTION
 banner("1. EXTRACTION  (GDC -> H-optimus-0 embeddings)")
+
+# Seed from any earlier run mounted as a kernel source or dataset.
+#
+# Two full-cohort attempts died mid-run and produced NO output at all - not the
+# embeddings, not the log, not the trail fsync'd in the first second. The whole
+# container went, at 86 minutes and again at 3 h 45. A 34-minute run finished
+# cleanly. Nothing inside the container can explain a failure that discards the
+# container, so rather than keep paying hours to learn nothing, runs are kept
+# short and made to accumulate: each one inherits every slide its predecessors
+# encoded, adds what it can inside PATHGRADE_MAX_EXTRACT_HOURS, and exits
+# cleanly so Kaggle actually commits the result.
+#
+# Extraction was always idempotent - it skips slides already in out-dir - but
+# that only helps if the previous output survived to be mounted. This is the
+# missing half of that property.
+seeded = 0
+for src_h5 in glob.glob("/kaggle/input/**/features/*.h5", recursive=True):
+    dest = OUT / os.path.basename(src_h5)
+    if not dest.exists():
+        try:
+            shutil.copy(src_h5, dest)
+            seeded += 1
+        except OSError as e:
+            print(f"  could not seed {os.path.basename(src_h5)}: {e}", flush=True)
+if seeded:
+    print(f"seeded {seeded} slides from previous runs", flush=True)
+trail("SEEDED", f"{seeded} slides inherited")
+
 already = len(list(OUT.glob("*.h5")))
 print(f"{already} slides already extracted (these are skipped)", flush=True)
-
-from pathgrade.preprocessing.stream_extract import main as extract_main
 
 extract_argv = [
     "--out-dir", str(OUT),
@@ -201,10 +313,11 @@ extract_argv = [
     "--format", "h5",
     "--max-patches", str(MAX_PATCHES),
     "--batch-size", BATCH_SIZE,
-    "--download-workers", "4",
-    "--prefetch", "4",
+    "--download-workers", DOWNLOAD_WORKERS,
+    "--prefetch", PREFETCH,
     "--decode-workers", DECODE_WORKERS,
-    "--max-hours", "6.5",
+    "--tpu-cores", TPU_CORES,
+    "--max-hours", MAX_EXTRACT_HOURS,
     "--min-free-gb", "4",
     "--notify-every", "25",
 ]
@@ -216,14 +329,109 @@ if RANDOM_WEIGHTS:
     # by construction - the point is to prove the plumbing, not the model.
     extract_argv += ["--random-weights"]
     print("!! REHEARSAL: random weights. Metrics below are meaningless.", flush=True)
-print("argv:", " ".join(extract_argv), flush=True)
-extract_code = extract_main(extract_argv)
+
+# Progress needs a channel that does NOT live in /kaggle/working. On
+# 2026-08-22 a run executed for 86 minutes, errored, and produced no output at
+# all - not the embeddings, not the log, not even the fsync'd trail written in
+# its first second. The whole volume went. A trail file cannot describe a
+# failure that discards the trail, so anything worth knowing during a long run
+# has to leave the machine while it is still running.
+#
+# ProgressReporter already speaks Discord/Slack/Telegram and swallows its own
+# errors, so a dead webhook can never hurt the run. Supply it the same way as
+# the token: a file in an attached private dataset, or a baked env var.
+def find_webhook():
+    if os.environ.get("PATHGRADE_WEBHOOK"):
+        return os.environ["PATHGRADE_WEBHOOK"], "env"
+    for path in glob.glob("/kaggle/input/**/webhook_url.txt", recursive=True):
+        try:
+            value = open(path).read().strip()
+            if value.startswith("http"):
+                return value, f"file:{path}"
+        except OSError:
+            pass
+    return None, None
+
+
+WEBHOOK, webhook_src = find_webhook()
+# Never print the URL: a Discord/Slack hook URL is itself the credential.
+trail("WEBHOOK", webhook_src or "none (long runs will be unobservable if output is lost)")
+if WEBHOOK:
+    extract_argv += ["--webhook-url", WEBHOOK, "--notify-every", "10"]
+
+print("argv:", " ".join(a for a in extract_argv if not a.startswith("http")), flush=True)
+
+# Extraction gets the same guarantee training has always had, and for the same
+# reason: it is the expensive half. An unhandled exception at slide 400 used to
+# kill the kernel outright, discarding both the 399 slides already encoded and
+# any chance of training on them. Whatever landed on disk is worth keeping and
+# worth training on - extraction is idempotent, so a later run resumes.
+# Extraction runs OUT OF PROCESS, and this is the most important robustness
+# property in the kernel.
+#
+# On 2026-08-22 a 435-slide run executed for 86 minutes, errored, and produced
+# no output whatsoever - not the embeddings, not the log, not even the trail
+# file fsync'd in its first second. A Python-level guard cannot catch that: a
+# segfault in a C extension (OpenSlide and libtiff both parse untrusted TIFFs
+# from 435 different scanners) kills the interpreter outright, and a container
+# torn down that way never reaches Kaggle's output-commit step.
+#
+# As a child, the worst it can do is die. The parent stays alive, keeps every
+# slide already written, records how the child died - including the signal, so
+# a segfault is distinguishable from an exception - and still trains and
+# commits output. stdout is inherited, so per-slide progress still streams.
+extract_code, extract_error = None, None
+child = [sys.executable, "-u", "-m", "pathgrade.preprocessing.stream_extract"] + extract_argv
+child_env = {**os.environ, "PYTHONPATH": f"{SRC}/src"}
+trail("STEP", f"extraction subprocess, {len(extract_argv)} args")
+try:
+    extract_code = subprocess.run(child, env=child_env).returncode
+    if extract_code is not None and extract_code < 0:
+        # Negative means killed by a signal: -11 SIGSEGV, -9 SIGKILL (the OOM
+        # killer). Resolving the name is best-effort - not every signal number
+        # is in the enum on every platform, and raising here, inside the
+        # handler for a crash, would lose the very information we came for.
+        try:
+            import signal as _sig
+
+            name = _sig.Signals(-extract_code).name
+        except (ValueError, ImportError):
+            name = "unknown signal"
+        extract_error = f"extraction child killed by {name} ({extract_code})"
+    elif extract_code not in (0, 1):
+        # 1 is the documented "finished, but some slides failed" return.
+        extract_error = f"extraction child exited {extract_code}"
+except BaseException:
+    extract_error = traceback.format_exc()
+
+if extract_error:
+    trail("EXTRACTION_FAILED", extract_error.strip().splitlines()[-1][:200])
+    banner("EXTRACTION FAILED - keeping what was encoded")
+    print(extract_error, flush=True)
+    with open(WORK / "EXTRACTION_FAILED.txt", "w") as f:
+        f.write(extract_error)
+        f.flush()
+        os.fsync(f.fileno())
+
 extracted = sorted(p.stem for p in OUT.glob("*.h5"))
-print(f"\nextraction finished: {len(extracted)} slides, exit={extract_code}", flush=True)
+print(f"\nextraction finished: {len(extracted)} slides, exit={extract_code}"
+      f"{' (RAISED)' if extract_error else ''}", flush=True)
+trail("EXTRACTED", f"{len(extracted)} slides")
 
 if not extracted:
     trail("FATAL", "no features extracted, nothing to train on")
     sys.exit("FATAL: no features extracted, nothing to train on")
+
+# An intermediate chunk banks its embeddings and stops. Training on a partial
+# cohort is not just wasted minutes - it is minutes spent inside a container
+# that has twice been killed without committing anything, which would take the
+# slides this run just paid for down with it. Bank first, train once at the end.
+if SKIP_TRAIN:
+    trail("SKIP_TRAIN", f"{len(extracted)} slides banked, exiting before training")
+    banner(f"TRAINING SKIPPED - {len(extracted)} slides banked as output")
+    print("")
+    print(f"total elapsed {(time.time() - T0) / 3600:.2f} h", flush=True)
+    raise SystemExit(0)
 
 # ------------------------------------------------------------- 2. TRAINING
 banner("2. TRAINING  (TPU VM cpu - the head is ~530K params)")

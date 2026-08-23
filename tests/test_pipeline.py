@@ -627,3 +627,179 @@ def test_cached_training_still_randomises_sub_bags(features):
     ds = SlideBagDataset(big[:1], labels, d, bag_size=256, train=True, preload=True)
     first, second = ds[0]["features"], ds[0]["features"]
     assert not torch.allclose(first, second), "sub-bag sampling should differ per call"
+
+
+# --------------------------------------------------------------------------
+# Multi-device encode: data parallelism must not change the answer
+#
+# The whole point of spreading tiles across eight XLA devices is throughput,
+# so the one thing that must not move is the output. These pin the parallel
+# path against the serial one that was validated on 60 real slides.
+# --------------------------------------------------------------------------
+import threading as _threading
+
+
+class _SlowIndexEncoder(_IndexEncoder):
+    """_IndexEncoder that records its own batch count and yields the GIL.
+
+    The sleep is what lets a second replica pick work off the queue, which is
+    what makes the distribution assertion meaningful rather than incidental.
+    """
+
+    def __init__(self, delay: float = 0.002):
+        self.calls = 0
+        self.delay = delay
+        self._lock = _threading.Lock()
+
+    def __call__(self, batch):
+        with self._lock:
+            self.calls += 1
+        time.sleep(self.delay)
+        return super().__call__(batch)
+
+
+@pytest.mark.parametrize("n_devices", [2, 4, 8])
+def test_encode_tiles_multi_device_preserves_order(monkeypatch, n_devices):
+    """Tile i lands at row i no matter which replica encoded its batch."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), x % 251, dtype=np.uint8),
+    )
+    n = 500
+    replicas = [_SlowIndexEncoder() for _ in range(n_devices)]
+    feats = se.encode_tiles(
+        object(), _FakeGrid(n), replicas, lambda t: t,
+        batch_size=32, num_workers=8, queue_depth=2,
+    )
+    assert feats.shape == (n, 4)
+    assert np.array_equal(feats[:, 0], np.arange(n, dtype=np.float32) % 251)
+
+
+def test_multi_device_output_is_identical_to_single_device(monkeypatch):
+    """Byte-for-byte agreement with the serial path, ragged tail included."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), (x * 7) % 251, dtype=np.uint8),
+    )
+    n = 333                                   # deliberately not a batch multiple
+    grid = _FakeGrid(n)
+    serial = se.encode_tiles(object(), grid, _IndexEncoder(), lambda t: t,
+                             batch_size=64, num_workers=4, queue_depth=3)
+    parallel = se.encode_tiles(object(), grid, [_SlowIndexEncoder(0.0) for _ in range(4)],
+                               lambda t: t, batch_size=64, num_workers=4, queue_depth=3)
+    assert np.array_equal(serial, parallel)
+
+
+def test_multi_device_actually_spreads_work(monkeypatch):
+    """More than one replica must do work, or the parallelism is decorative."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), x % 251, dtype=np.uint8),
+    )
+    n, batch_size = 640, 32
+    replicas = [_SlowIndexEncoder(0.004) for _ in range(4)]
+    se.encode_tiles(object(), _FakeGrid(n), replicas, lambda t: t,
+                    batch_size=batch_size, num_workers=8, queue_depth=2)
+
+    assert sum(r.calls for r in replicas) == n // batch_size
+    assert sum(1 for r in replicas if r.calls) >= 2
+
+
+def test_multi_device_failure_raises_instead_of_returning_partial(monkeypatch):
+    """A dead replica must not yield a half-filled array that looks valid.
+
+    np.empty is uninitialised, so swallowing this would hand back plausible
+    garbage embeddings - the worst possible failure for a grading model.
+    """
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), x % 251, dtype=np.uint8),
+    )
+
+    class _Broken(_IndexEncoder):
+        def __call__(self, batch):
+            raise RuntimeError("device fell over")
+
+    with pytest.raises(RuntimeError, match="device fell over"):
+        se.encode_tiles(object(), _FakeGrid(256), [_Broken(), _Broken()], lambda t: t,
+                        batch_size=32, num_workers=4, queue_depth=2)
+
+
+def test_single_encoder_still_accepted_unwrapped(monkeypatch):
+    """The existing call signature must keep working untouched."""
+    from pathgrade.preprocessing import stream_extract as se
+
+    monkeypatch.setattr(
+        se, "read_tile",
+        lambda slide, x, y, grid: np.full((4, 4, 3), x % 251, dtype=np.uint8),
+    )
+    feats = se.encode_tiles(object(), _FakeGrid(64), _IndexEncoder(), lambda t: t,
+                            batch_size=32, num_workers=4, queue_depth=2)
+    assert feats.shape == (64, 4)
+
+
+def test_xla_devices_empty_without_torch_xla():
+    """Off TPU this must degrade to the single-device path, not explode."""
+    from pathgrade.encoders import xla_devices
+
+    devices = xla_devices()
+    assert isinstance(devices, list)
+    if not torch.cuda.is_available():
+        try:
+            import torch_xla  # noqa: F401
+        except Exception:
+            assert devices == []
+
+
+def test_build_encoders_returns_single_replica_off_tpu(monkeypatch):
+    """max_devices>1 on a CPU box must still give exactly one encoder."""
+    from pathgrade import encoders as enc_mod
+
+    built = []
+
+    class _Stub:
+        def __init__(self, spec, device=None, random_weights=False):
+            built.append(device)
+            self.spec, self.device = spec, torch.device("cpu")
+
+    monkeypatch.setattr(enc_mod, "PatchEncoder", _Stub)
+    out = enc_mod.build_encoders(enc_mod.get_spec("h-optimus-0"),
+                                 device=torch.device("cpu"), max_devices=8)
+    assert len(out) == 1, "non-XLA devices must not be replicated"
+
+
+def test_build_encoders_refuses_to_thread_across_xla_devices(monkeypatch):
+    """XLA multi-device threading is measured-broken; degrade, do not crash.
+
+    cores_probe.py on a real v5e-8: 2 threads fine, 3/4 dead at four devices,
+    7/8 dead at eight, all in SyncLiveTensorsGraph. Shipping that would fail
+    every slide of a multi-hour extraction, so build_encoders keeps one replica
+    unless explicitly forced.
+    """
+    from pathgrade import encoders as enc_mod
+
+    class _Stub:
+        def __init__(self, spec, device=None, random_weights=False):
+            self.spec, self.device = spec, torch.device("xla:0")
+
+    monkeypatch.setattr(enc_mod, "PatchEncoder", _Stub)
+    monkeypatch.setattr(enc_mod, "xla_devices",
+                        lambda: [torch.device(f"xla:{i}") for i in range(8)])
+    monkeypatch.delenv("PATHGRADE_FORCE_XLA_THREADS", raising=False)
+
+    out = enc_mod.build_encoders(enc_mod.get_spec("h-optimus-0"),
+                                 device=torch.device("xla:0"), max_devices=8)
+    assert len(out) == 1, "must not replicate across XLA devices by default"
+
+    monkeypatch.setenv("PATHGRADE_FORCE_XLA_THREADS", "1")
+    forced = enc_mod.build_encoders(enc_mod.get_spec("h-optimus-0"),
+                                    device=torch.device("xla:0"), max_devices=8)
+    assert len(forced) == 8, "explicit override must still work"

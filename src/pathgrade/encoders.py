@@ -22,6 +22,7 @@ alone is not diligence.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -181,6 +182,98 @@ def resolve_device(device: str = "auto") -> torch.device:
         return xm.xla_device()
     except ImportError:
         return torch.device("cpu")
+
+
+def xla_devices() -> list[torch.device]:
+    """Every XLA device this process can address, in order.
+
+    A Kaggle TPU v5e-8 exposes eight, but the extraction loop historically used
+    ``xla:0`` alone - one core of eight, which is the single largest piece of
+    idle hardware in the job. Returns ``[]`` off TPU so callers can treat the
+    single-device case as the default rather than a special case.
+    """
+    try:
+        import torch_xla.core.xla_model as xm
+    except Exception:
+        return []
+    devices = None
+    try:
+        devices = xm.get_xla_supported_devices()
+    except Exception:
+        devices = None
+    if not devices:
+        try:
+            devices = [xm.xla_device()]
+        except Exception:
+            return []
+    return [torch.device(str(d)) for d in devices]
+
+
+def build_encoders(
+    spec: EncoderSpec,
+    device: str | torch.device = "auto",
+    max_devices: int = 1,
+    random_weights: bool = False,
+    verbose: bool = True,
+) -> list["PatchEncoder"]:
+    """Build one encoder replica per device, for data-parallel inference.
+
+    Replicas are independent: the encoder is frozen and every batch is
+    self-contained, so there is nothing to synchronise and no collective
+    communication. That is what makes plain threads sufficient here and keeps
+    this far simpler than a distributed training setup.
+
+    Construction is deliberately incremental and forgiving. Each replica costs
+    a full set of weights in host RAM before it lands on its device, and a
+    partial set is still useful - four cores beat one. If a replica fails to
+    build, the ones already built are returned rather than sinking the run.
+    """
+    primary = resolve_device(device) if isinstance(device, str) else device
+    encoders = [PatchEncoder(spec, device=primary, random_weights=random_weights)]
+    if max_devices <= 1 or primary.type != "xla":
+        return encoders
+
+    # MEASURED 2026-08-22 on a Kaggle TPU v5e-8 (kaggle/cores_probe.py):
+    # driving several XLA devices from several Python threads in ONE process
+    # is not safe. Two threads worked; at four, three of four died, and at
+    # eight, seven of eight died, all with
+    #
+    #   torch_xla/csrc/xla_graph_executor.cpp:691 : Check failed: tensor_data
+    #     torch_xla::XLAGraphExecutor::SyncLiveTensorsGraph(...)
+    #
+    # mark_step() syncs *live tensors on a device*, not just the caller's, so
+    # concurrent threads tear each other's in-flight tensors out from under the
+    # forward pass. Throughput per surviving thread stayed at 123 patches/s, so
+    # this is a correctness failure, not a contention one - and with only one
+    # thread surviving, eight "devices" delivered 68 patches/s, slower than one.
+    #
+    # The supported way to use all eight is one process per device
+    # (torch_xla.distributed.xla_multiprocessing.spawn), which is what
+    # --shard/--num-shards exist for. Until that lands, degrade loudly rather
+    # than fail every slide of a multi-hour run.
+    if not os.environ.get("PATHGRADE_FORCE_XLA_THREADS"):
+        print(
+            f"!! --tpu-cores {max_devices} ignored on XLA: multi-device threading is "
+            f"measured-broken (7/8 threads crash in SyncLiveTensorsGraph). Using 1 "
+            f"device at ~123 patches/s. Use one process per device for real "
+            f"parallelism; set PATHGRADE_FORCE_XLA_THREADS=1 to override.",
+            flush=True,
+        )
+        return encoders
+
+    available = xla_devices()
+    # Put the primary first and keep the rest in device order.
+    rest = [d for d in available if str(d) != str(primary)][: max_devices - 1]
+    for dev in rest:
+        try:
+            encoders.append(PatchEncoder(spec, device=dev, random_weights=random_weights))
+            if verbose:
+                print(f"  replica {len(encoders)}/{max_devices} on {dev}", flush=True)
+        except Exception as e:  # pragma: no cover - device dependent
+            print(f"  !! replica on {dev} failed ({type(e).__name__}: {e}); "
+                  f"continuing with {len(encoders)}", flush=True)
+            break
+    return encoders
 
 
 class PatchEncoder(nn.Module):

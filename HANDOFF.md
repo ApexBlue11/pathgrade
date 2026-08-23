@@ -141,13 +141,36 @@ Recorded in `src/pathgrade/platform.py`.
 
 ### Measured throughput
 
+Everything below with **real H-optimus-0 weights** unless noted.
+
 | | measured |
 |---|---|
 | GDC download, 4 parallel streams | **143 MB/s** (25.6 single — 5.6× win) |
 | tile decode | 1900–2500 tiles/s, same from any mount |
-| **full pipeline** | **87 slides/h @ 3000 patches** |
+| encoder, one XLA device | **123.5 patches/s** (confirmed twice, forced `.cpu()`) |
+| full pipeline, random weights | 87 slides/h @ 3000 patches |
+| **full pipeline, real weights** | **73–90 slides/h** (40- and 79-slide chunks) |
 | training, 5-fold CV | **2.8 min / 60 slides** (was 21.3 before the RAM cache) |
-| **projected full cohort** | **~5.5 h** (5.0 extraction + 0.5 training) |
+
+### Where a slide's time actually goes (c1, 79 slides, instrumented)
+
+| stage | median | share of in-slide time |
+|---|---|---|
+| `grid_seconds` (tissue + tiling) | 2.5 s | 10% |
+| `encode_seconds` | 24.5 s | **89%** |
+| `write_seconds` (h5 + gzip) | 0.2 s | 1% |
+
+But `slide_seconds` summed to 2142 s against a **3158 s** extraction wall, so
+**~32% of the wall is the consumer waiting on downloads**. That is *not*
+bandwidth: `SlidePrefetcher` yields results strictly in record order, so one
+slow download (max seen 63 s) stalls every slide queued behind it, even those
+already on disk. Fixing that head-of-line blocking — consuming completed
+downloads out of order — is the cheapest remaining win, worth ~1.3× on
+extraction. It was left alone during the extraction campaign because the
+prefetcher is the component that produced bug #1.
+
+A guess worth recording as wrong: before instrumenting, the missing time was
+assumed to be tissue detection. It is 10%.
 
 ### Numbers that were WRONG — do not reuse
 
@@ -172,7 +195,10 @@ Recorded in `src/pathgrade/platform.py`.
 - Real pretrained weight loading (`pathgrade-load`, public 1.13B ViT-g):
   9.09 GB download 62 s, XLA move 1 s, forward 8 s, `PatchEncoder` + width probe
   16 s, peak RSS 13.3 GB of 396 GB.
-- **107 unit tests**, including regression tests for every bug below.
+- **116 unit tests**, including regression tests for every bug below and for
+  the multi-device encode path (order preservation, byte-identical agreement
+  with the serial path, work actually spreading across replicas, and a dead
+  replica raising instead of returning uninitialised rows).
 
 ### NOT proven — be honest about this
 
@@ -182,7 +208,15 @@ Recorded in `src/pathgrade/platform.py`.
 - **H-optimus-0 itself has never been downloaded** — it is gated and needs the
   owner's token. All rehearsals used `--random-weights`. The public ViT-g test
   covers the same code path but not that exact repo.
-- Training time at 435 slides is **extrapolated** (~0.5 h) from 60 slides.
+- Training time at 435 slides is **extrapolated** (~0.5 h) from 60 slides, and
+  that extrapolation assumed 3000 patches/slide. `bag_size` is derived from the
+  cohort median, so raising `--max-patches` raises training cost roughly
+  linearly in total patches.
+- **Multi-device speedup is unmeasured.** The code is tested for correctness on
+  CPU, but whether eight threads actually beat one on TPU depends on how much
+  of a lazy-tensor ViT-g forward holds the GIL. `cores_probe.py` measures it.
+- **The 8-stream download setting is a guess.** 4 streams measured 143 MB/s and
+  nobody tried more; once encoding is 8x faster, download is the floor.
 - No external validation cohort. CPTAC-HNSCC is the obvious second.
 
 ---
@@ -210,9 +244,38 @@ the real thing on real data.
    The most important kernel was the least observable, which is why two of the
    owner's runs produced nothing to debug. Fixed.
 
+### Session 2 (2026-08-22/23) added five more, same lesson
+
+10. **Multi-device XLA threading is broken, and the benchmark said otherwise.**
+    `cores_probe.py` reported `speedup 8.54, threads_scale: true`. It divided
+    *intended* work by wall time without checking the threads finished. Seven
+    of eight had died in `SyncLiveTensorsGraph`; the true figure was 68
+    patches/s, **slower than one device**. Identical in shape to the retracted
+    1226. Any throughput number must verify the work happened.
+11. **`reporter.update()` was only called on failure.** The heartbeat read
+    `done: 0` after 40 successful slides, and the webhook would only ever have
+    fired on errors - so a slow run was indistinguishable from a dead one. This
+    silently defeated the observability work built the same hour.
+12. **Extraction had no exception guard** while training had one since day one.
+    The *expensive* half was the unprotected one: a raise at slide 400 discarded
+    399 encoded slides.
+13. **A syntax error was pushed to Kaggle.** It still waits out the ~40 min TPU
+    queue before dying in 2 s. `push.py` now refuses to publish anything that
+    fails `ast.parse`.
+14. **The parent must never touch an XLA device** if a child needs one -
+    creating a device claims the TPU for that process's lifetime. The
+    accelerator check runs in a throwaway subprocess.
+
 **Wrong hypotheses I burned time on**: pip upgrading torch, HF cache filling the
-root FS, `/kaggle/tmp` being slow, batch size, non-zero exit discarding output.
+root FS, `/kaggle/tmp` being slow, batch size, non-zero exit discarding output,
+and (session 2) tissue detection being the unmeasured half of slide time - it
+is 10%, the real answer was download head-of-line blocking.
 All disproved by measurement. **Measure the real path; do not reason about it.**
+
+One environment note that cost real time: in this Git-Bash-on-Windows shell,
+`sed` and `py_compile` returned **stale cached content** immediately after a
+successful write, so a correct fix looked like it had failed twice. Use the
+Read/Edit file tools for edits that matter.
 
 Kaggle's log endpoint has returned **zero bytes even for runs that COMPLETED
 successfully** (`pathgrade-load`). An empty log proves nothing. Trust the
@@ -222,31 +285,84 @@ fsync'd trail file in the output.
 
 ## 9. Where things stand RIGHT NOW
 
-**Blocked on one manual step.** The full run has never executed.
+**Updated 2026-08-23.** Extraction is running as a chain of short kernels.
+Real H-optimus-0 embeddings exist for the first time.
 
-Kernel: **https://www.kaggle.com/code/apexblue/pathgrade-pipeline** (v5, has the
-trail instrumentation).
+### Launching no longer needs a human
 
-- `HF_TOKEN` **is already ticked** — it survived the v5 push.
-- **Accelerator must be set to TPU VM** (metadata ships CPU deliberately so the
-  API auto-run fails in 2 s instead of burning an hour of TPU queue).
-- Then **Save & Run All** from the UI. It is a background batch job; the machine
-  can be shut down.
+`hf_token.txt` lives in the private dataset `apexblue/pathgrade-token`
+(`isPrivate: true`). `load_token()` finds it at
+`/kaggle/input/**/hf_token.txt`, so an API push both deploys and runs. Kaggle's
+secrets service is confirmed unavailable to API-pushed kernels - it returns
+`ConnectionError: Connection error trying to communicate with service` for
+every key, which the pipeline now records instead of swallowing.
 
-Expect ~5.5 h plus queue. On completion:
+    python kaggle/publish_src.py -m "..."   # ONLY when src/ changes
+    python kaggle/push.py pipeline_tpu ...  # pushes AND starts a run
 
-```bash
-python kaggle/collect.py apexblue/pathgrade-pipeline
-```
+`publish_src.py` exists because **`tcga_hnsc_labels.csv` is in the dataset but
+not in git**; building the dataset from the repo alone deletes the labels and
+breaks training hours later. It downloads the current version first and aborts
+if the CSV is missing. `--dir-mode` also defaults to `skip`, which would
+silently upload a dataset containing no `src/` at all.
 
-That checks for `TRAINING_FAILED.txt` and the expected artifacts before
-reporting anything — a COMPLETE status is **not** proof of success, because the
-training phase deliberately swallows failures to preserve hours of embeddings.
+`push.py` refuses to publish a script that fails `ast.parse`. A kernel with a
+syntax error still waits out the full TPU queue before dying in two seconds.
 
-If it fails, pull `pipeline_trail.txt` from the output; it names the last step
-that started.
+### THE BIG PROBLEM: long runs are killed and lose everything
 
----
+| run | duration | result |
+|---|---|---|
+| v6, 435 slides | 86 min | ERROR, **zero output** |
+| smoke, 40 slides | 34 min | COMPLETE, full output |
+| v7, 435 slides | 3 h 45 | ERROR, **zero output** |
+| c1, chunked | 54 min | COMPLETE, full output |
+
+"Zero output" means nothing at all - not the embeddings, not the log, not even
+`pipeline_trail.txt`, which is fsync'd in the first second. Control fetches
+against finished kernels return their files instantly, so the endpoint is fine
+and retention lasts days. Extraction was moved into a **child process** to
+survive a segfault in OpenSlide/libtiff; v7 still lost everything, which proves
+the *whole container* is being killed, not the extraction process.
+
+**The cause is still unknown and probably cannot be found from inside.** A
+trail file cannot describe a failure that discards the trail. The fix for that
+is `--webhook-url`, which `ProgressReporter` already supports for
+Discord/Slack/Telegram and which `find_webhook()` will pick up from
+`/kaggle/input/**/webhook_url.txt` or `PATHGRADE_WEBHOOK`. **Nobody has
+supplied one yet.** Do that before attempting any long run again.
+
+### So extraction runs as a chain of short, cumulative kernels
+
+Each kernel seeds `/kaggle/working/features` from the previous kernel's output
+mounted via `kernel_sources`, extracts for `PATHGRADE_MAX_EXTRACT_HOURS`
+(default **0.85 h**), skips training, and exits cleanly so Kaggle commits.
+Extraction was always idempotent; seeding supplies the missing half.
+
+    python kaggle/push.py pipeline_tpu --as pathgrade-cN         --kernel-source apexblue/pathgrade-c<N-1>         --env PATHGRADE_SKIP_TRAIN=1
+
+Chain so far: `pathgrade-smoke` (40) -> `pathgrade-c1` (**119 banked**) -> `c2` ...
+Each chunk adds ~79 slides, so roughly four chunks reach 435.
+
+**The final chunk drops `PATHGRADE_SKIP_TRAIN`** so it trains and produces the
+release bundle. Then:
+
+    python kaggle/collect.py apexblue/pathgrade-cN
+
+A COMPLETE status is still not proof: check `TRAINING_FAILED.txt` and
+`EXTRACTION_FAILED.txt`, which `collect.py` does.
+
+### Verified real embeddings
+
+119 files, 0.99 GB, all 3000 patches x 1536, coords aligned, attrs say
+`encoder: h-optimus-0, random_weights: False`. 435 slides projects to ~3.6 GB
+against the 20.9 GB cap.
+
+### Training note
+
+A 40-slide chunk failed training with `Rarest class has 4 patients but
+n_folds=5`. That is a small-cohort artifact, not a bug - G1 has 56 patients at
+435. It is why intermediate chunks skip training.
 
 ## 10. Roadmap once a real number exists
 

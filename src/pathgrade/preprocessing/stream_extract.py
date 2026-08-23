@@ -37,7 +37,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..encoders import DEFAULT_ENCODER, PatchEncoder, check_licence, describe_registry, resolve_device
+from ..encoders import (DEFAULT_ENCODER, PatchEncoder, build_encoders, check_licence,
+                        describe_registry, resolve_device)
 from ..progress import ProgressReporter
 from .gdc import SlideRecord, download_slide, free_disk_gb, one_slide_per_patient, query_slides, shard, summarise
 from .tiling import build_grid, read_tile
@@ -161,17 +162,121 @@ class SlidePrefetcher:
             yield item
 
 
+def _encode_batch(encoder: PatchEncoder, start: int, tiles: list, batch_size: int,
+                  out: np.ndarray) -> None:
+    """Encode one batch of decoded tiles into ``out[start:start+len(tiles)]``.
+
+    Shared by the single- and multi-device paths so the padding rule and the
+    device round trip exist in exactly one place.
+
+    ``.cpu()`` is what actually forces execution. XLA builds its graph lazily,
+    so a benchmark - or a worker thread - that never materialises the result
+    measures graph construction and nothing else. That mistake produced this
+    repo's fictional 1226 patches/s.
+    """
+    batch = torch.from_numpy(np.stack(tiles))
+    real = batch.shape[0]
+    if real < batch_size:
+        # Constant shape for XLA: pad by repeating, then slice the result.
+        batch = torch.cat([batch, batch[-1:].expand(batch_size - real, *batch.shape[1:])])
+    feats = encoder(batch)
+    if encoder.is_xla:
+        import torch_xla.core.xla_model as xm
+
+        xm.mark_step()
+    out[start : start + real] = feats[:real].cpu().numpy()
+
+
+def _encode_parallel(decode_one, n: int, encoders: list, batch_size: int,
+                     num_workers: int, queue_depth: int, out: np.ndarray) -> None:
+    """Data-parallel encode across several devices, one thread per device.
+
+    The encoder is frozen and every batch is independent, so replicas need no
+    collective communication - which is why threads are enough and a
+    multi-process launcher is not required. Decoded batches go onto a bounded
+    queue and whichever device is free takes the next one, so a slow device
+    holds nobody up.
+
+    Threads only help if the forward pass releases the GIL. It does: dispatch
+    and the blocking device transfer are both C++. That is measured by
+    ``kaggle/cores_probe.py``, not assumed here.
+
+    Each thread writes a disjoint slice of ``out``, so no lock is needed on the
+    output. Failures are collected and re-raised on the caller's thread rather
+    than left to strand a half-filled array as a valid-looking result.
+    """
+    batch_q: queue.Queue = queue.Queue(maxsize=len(encoders) * max(1, queue_depth))
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def device_worker(encoder: PatchEncoder) -> None:
+        while True:
+            item = batch_q.get()
+            if item is None:
+                return
+            if stop.is_set():
+                continue          # keep draining so the producer never blocks
+            try:
+                with torch.no_grad():
+                    _encode_batch(encoder, item[0], item[1], batch_size, out)
+            except BaseException as e:      # noqa: BLE001 - re-raised below
+                errors.append(e)
+                stop.set()
+
+    threads = [threading.Thread(target=device_worker, args=(e,), daemon=True)
+               for e in encoders]
+    for t in threads:
+        t.start()
+
+    max_inflight = max(batch_size * max(1, queue_depth) * len(encoders), batch_size)
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, num_workers)) as pool:
+            pending: deque = deque()
+            buffered: list[np.ndarray] = []
+            start = 0
+
+            def drain_one():
+                nonlocal start, buffered
+                buffered.append(pending.popleft().result())
+                if len(buffered) == batch_size:
+                    batch_q.put((start, buffered))
+                    start += batch_size
+                    buffered = []
+
+            for i in range(n):
+                if stop.is_set():
+                    break
+                pending.append(pool.submit(decode_one, i))
+                if len(pending) >= max_inflight:
+                    drain_one()
+            while pending and not stop.is_set():
+                drain_one()
+            if buffered and not stop.is_set():
+                batch_q.put((start, buffered))
+    finally:
+        for _ in threads:
+            batch_q.put(None)
+        for t in threads:
+            t.join()
+
+    if errors:
+        raise errors[0]
+
+
 @torch.no_grad()
 def encode_tiles(
     slide,
     grid,
-    encoder: PatchEncoder,
+    encoder: PatchEncoder | list,
     transform,
     batch_size: int,
     num_workers: int = 8,
     queue_depth: int = 3,
 ) -> np.ndarray:
     """Encode every tile in ``grid``, decoding tiles on a thread pool.
+
+    ``encoder`` may be a single ``PatchEncoder`` or a list of replicas on
+    different devices; with a list the work is spread across all of them.
 
     Tile decoding, not the accelerator, is the usual bottleneck: a serial
     ``read_region`` + resize runs around 100 tiles/s, which would leave a TPU
@@ -184,27 +289,25 @@ def encode_tiles(
     Batches are submitted ``queue_depth`` ahead so decoding for batch n+1
     overlaps the forward pass for batch n.
     """
+    encoders = list(encoder) if isinstance(encoder, (list, tuple)) else [encoder]
     coords = grid.coords
     n = len(coords)
-    out = np.empty((n, encoder.spec.embed_dim), dtype=np.float32)
+    out = np.empty((n, encoders[0].spec.embed_dim), dtype=np.float32)
 
     def decode_one(i: int) -> np.ndarray:
         return transform(read_tile(slide, int(coords[i][0]), int(coords[i][1]), grid))
 
+    if len(encoders) > 1:
+        _encode_parallel(decode_one, n, encoders, batch_size, num_workers, queue_depth, out)
+        return out
+
+    # ---- single device: the path validated on 60 real slides, left intact ----
+    solo = encoders[0]
+
     def encode(start: int, tiles: list[np.ndarray]) -> None:
         # Stack as uint8 and let the accelerator normalise; float math in the
         # decode threads competes for the cores that are already the limit.
-        batch = torch.from_numpy(np.stack(tiles))
-        real = batch.shape[0]
-        if real < batch_size:
-            # Constant shape for XLA: pad by repeating, then slice the result.
-            batch = torch.cat([batch, batch[-1:].expand(batch_size - real, *batch.shape[1:])])
-        feats = encoder(batch)
-        if encoder.is_xla:
-            import torch_xla.core.xla_model as xm
-
-            xm.mark_step()
-        out[start : start + real] = feats[:real].cpu().numpy()
+        _encode_batch(solo, start, tiles, batch_size, out)
 
     # Parallelism must be at the *tile* level. Submitting one task per batch and
     # decoding its tiles serially caps concurrency at the queue depth no matter
@@ -239,23 +342,32 @@ def encode_tiles(
 def process_slide(
     record: SlideRecord,
     slide_path: Path,
-    encoder: PatchEncoder,
+    encoder: PatchEncoder | list,
     transform,
     out_path: Path,
     args,
 ) -> dict:
     import openslide
 
+    # ``encoder`` may be a list of device replicas; they share one spec.
+    spec = (encoder[0] if isinstance(encoder, (list, tuple)) else encoder).spec
+
+    t_open = time.time()
     slide = openslide.OpenSlide(str(slide_path))
     try:
+        # Timed separately because the 40-slide smoke run showed encode was only
+        # 50% of wall clock, leaving ~25 s/slide attributed to nothing that was
+        # being measured. Optimising the encoder cannot speed up uncounted work.
+        t_grid = time.time()
         grid = build_grid(
             slide,
-            out_px=encoder.spec.patch_px,
+            out_px=spec.patch_px,
             target_mpp=args.target_mpp,
             tissue_frac=args.tissue_frac,
             assume_mpp=args.assume_mpp,
             max_patches=args.max_patches,
         )
+        grid_seconds = time.time() - t_grid
         if len(grid.coords) == 0:
             raise ValueError("no tissue tiles found")
 
@@ -268,16 +380,16 @@ def process_slide(
     finally:
         slide.close()
 
-    if feats.shape[1] != encoder.spec.embed_dim:
+    if feats.shape[1] != spec.embed_dim:
         raise RuntimeError(
-            f"encoder produced width {feats.shape[1]}, registry declares {encoder.spec.embed_dim}"
+            f"encoder produced width {feats.shape[1]}, registry declares {spec.embed_dim}"
         )
 
     attrs = {
-        "encoder": encoder.spec.name,
+        "encoder": spec.name,
         "random_weights": bool(getattr(args, "random_weights", False)),
-        "encoder_licence": encoder.spec.licence,
-        "commercial_ok": encoder.spec.commercial_ok,
+        "encoder_licence": spec.licence,
+        "commercial_ok": spec.commercial_ok,
         "embed_dim": int(feats.shape[1]),
         "target_mpp": float(args.target_mpp),
         "base_mpp": float(grid.base_mpp),
@@ -289,13 +401,18 @@ def process_slide(
         "slide_barcode": record.slide_barcode,
         "patient_id": record.patient_id,
     }
+    t_write = time.time()
     store = feats.astype(np.float16 if not args.fp32_store else np.float32)
     write_features(out_path, store, grid.coords.astype(np.int64), attrs, args.format)
+    write_seconds = time.time() - t_write
 
     return {
         "patient_id": record.patient_id,
         "n_patches": int(feats.shape[0]),
         "encode_seconds": round(elapsed, 1),
+        "grid_seconds": round(grid_seconds, 1),
+        "write_seconds": round(write_seconds, 1),
+        "slide_seconds": round(time.time() - t_open, 1),
         "patches_per_sec": round(feats.shape[0] / max(elapsed, 1e-6), 1),
         "base_mpp": round(grid.base_mpp, 4),
         "gb": round(record.file_size / 1e9, 2),
@@ -361,8 +478,13 @@ def run(args) -> int:
         )
     print()
 
-    encoder = PatchEncoder(spec, device=device, random_weights=args.random_weights)
-    transform = encoder.build_transform()
+    encoders = build_encoders(spec, device=device, max_devices=args.tpu_cores,
+                              random_weights=args.random_weights)
+    transform = encoders[0].build_transform()
+    if len(encoders) > 1:
+        print(f"data-parallel across {len(encoders)} devices: "
+              f"{[str(e.device) for e in encoders]}", flush=True)
+    encoder = encoders if len(encoders) > 1 else encoders[0]
 
     journal_path = out_dir / f"journal_shard{args.shard}.jsonl"
     reporter = ProgressReporter(
@@ -413,6 +535,10 @@ def run(args) -> int:
                 )
                 with open(journal_path, "a") as f:
                     f.write(json.dumps(stats) + "\n")
+                # Without this the heartbeat reported done:0 forever and the
+                # webhook only fired on failures, so a run that was merely slow
+                # looked exactly like one that had died.
+                reporter.update(True, units=stats["n_patches"])
             except Exception as e:
                 failed += 1
                 print(f"  {record.patient_id}: EXTRACT FAILED - {e}", file=sys.stderr)
@@ -470,6 +596,10 @@ def build_parser():
     p.add_argument("--decode-workers", type=int, default=max(4, (os.cpu_count() or 8)),
                    help="threads decoding tiles. This, not the accelerator, is usually the limit")
     p.add_argument("--queue-depth", type=int, default=3, help="tile batches decoded ahead")
+    p.add_argument("--tpu-cores", type=int, default=1,
+                   help="XLA devices to encode across. A Kaggle TPU v5e-8 has 8 and the "
+                        "loop historically used 1. Replicas are independent (the encoder "
+                        "is frozen), so this is pure data parallelism. Ignored off TPU")
     p.add_argument("--min-free-gb", type=float, default=3.0,
                    help="stop cleanly when the output volume drops below this")
 

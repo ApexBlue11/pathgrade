@@ -57,22 +57,40 @@ Two numbers worth distrusting if you see them quoted anywhere earlier:
 * **1654 tiles/s for decode was measured on an 11 MB cached slide.** Real
   slides run 1900-2500 tiles/s from any mount, so storage was never the limit.
 
-Using all eight TPU cores is worth roughly 8x and is the obvious next
-optimisation, but it is multi-device plumbing and belongs after a working model.
+Using all eight TPU cores is implemented as `--tpu-cores` (see
+`build_encoders` and `_encode_parallel`). The encoder is frozen, so replicas are
+independent and need no collectives - plain threads, one per device, are
+sufficient. Measured scaling comes from `cores_probe.py`; if replication fails
+at runtime the code falls back to however many devices it managed, down to the
+single-device path validated on 60 real slides.
 
 ## Launch checklist
 
-An API push cannot attach secrets, so the first push is deliberately made with
-the accelerator set to CPU: the run starts immediately, fails in ~2 seconds at
-the token check, and burns no TPU queue. Then, in the UI:
+The token now arrives as a **file in a private dataset**
+(`apexblue/pathgrade-token`, containing `hf_token.txt`), which `load_token()`
+finds via `/kaggle/input/**/hf_token.txt`. That removes the UI from the loop
+entirely - an API push both deploys and launches:
 
-1. **Add-ons > Secrets** - tick `HF_TOKEN` (the secret is account-level; only
-   the attachment is per notebook)
-2. **Settings > Accelerator > TPU VM**
-3. **Save & Run All**
+```bash
+python kaggle/publish_src.py -m "what changed"   # only if src/ changed
+python kaggle/push.py pipeline_tpu               # pushes AND starts the run
+```
 
-Do not `kaggle kernels push` again afterwards - a new version can clear the
-attachment.
+`publish_src.py` first, always: kernels import the package from the dataset, so
+pushing kernel code against a stale dataset silently runs the old library.
+
+### A correction to what this file used to say
+
+It previously claimed the first push was "deliberately made with the
+accelerator set to CPU" so the auto-run would fail fast and burn no TPU queue.
+**That mechanism never existed.** `enable_tpu` has been `"true"` in
+`pipeline_tpu.kernel-metadata.json` since the first commit. The auto-run did
+fail in ~1 second, but at the *token gate*, not an accelerator guard - so the
+protection was accidental, and it disappears the moment the token resolves.
+
+The practical consequence: **every push requests a TPU session.** With TPU
+concurrency of 1, do not push a TPU kernel while another TPU run is queued or
+active.
 
 ## Order matters: TPU concurrency is 1
 
@@ -92,7 +110,7 @@ this model needs - it trains in minutes with no compilation risk. The TPU
 *devices* are the right tool for extraction (a 1B-parameter encoder over
 millions of tiles) and the wrong one for the aggregator.
 
-## Secrets do not survive an API push
+## Secrets do not survive an API push (superseded by the token dataset)
 
 H-optimus-0 is a gated HuggingFace repo, so extraction needs an `HF_TOKEN`.
 Kaggle secrets are attached **per notebook through the UI**, and a kernel pushed
