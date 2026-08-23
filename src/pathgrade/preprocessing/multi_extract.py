@@ -109,12 +109,24 @@ def main(argv=None) -> int:
     # chips for the parent's lifetime and leave nothing for the children.
     import torch_xla.distributed.xla_multiprocessing as xmp
 
+    # Two constraints, both learned from real runs rather than documentation.
+    #
     # nprocs MUST be None. An explicit count is rejected outright:
     #   ValueError: Unsupported nprocs (8). Please use nprocs=1 or None
     #   (default). If None, spawn will use all available devices.
-    # To cap it, set TPU_NUM_DEVICES in the environment instead.
+    #
+    # start_method MUST be "spawn", not the default fork. Determining the
+    # device count initialises the XLA computation client in this process, and
+    # forked children inherit that state, so every one of the eight died with
+    #   F runtime.cpp:21] Check failed: !g_computation_client_initialized
+    #   InitializeComputationClient() can only be called once.
+    # A fresh interpreter per child starts with that flag clear. This is safe
+    # only because _worker lives in an importable library module: "spawn"
+    # re-imports the entry module in each child (as __mp_main__, so the
+    # __main__ guard does not re-fire), which would be catastrophic if the
+    # entry point were the Kaggle kernel script.
     print("spawning one process per available XLA device", flush=True)
-    xmp.spawn(_worker, args=(argv,), nprocs=None)
+    xmp.spawn(_worker, args=(argv,), nprocs=None, start_method="spawn")
     return 0
 
 
