@@ -110,22 +110,57 @@ def main(argv=None) -> int:
     # chips for the parent's lifetime and leave nothing for the children.
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    # The TPU topology environment decides whether multiprocess is even
-    # possible, and on Kaggle it is pre-set. Children died with
-    #   Could not find SliceBuilder port 8476 in any of the 0 ports provided
-    #   in `tpu_process_addresses`="local"
-    # which is libtpu in single-process mode being asked to run eight. Print
-    # what is actually set before touching it - three attempts have now been
-    # spent guessing at this layer.
+    # UNRESOLVED after five real-TPU attempts. Recorded in full because
+    # guessing at this layer has cost real sessions each time; the next person
+    # (or model) should not re-derive it from nothing.
+    #
+    # Kaggle's actual environment (captured 2026-08-24, torch_xla 2.8.0,
+    # v5litepod-8):
+    #   TPU_PROCESS_ADDRESSES      local
+    #   TPU_CHIPS_PER_HOST_BOUNDS  2,4,1
+    #   TPU_HOST_BOUNDS            1,1,1
+    #   TPU_WORKER_ID              0
+    #   TPU_WORKER_HOSTNAMES       localhost
+    #   TPU_RUNTIME_METRICS_PORTS  8431,8432,...,8438   (8 ports, correctly)
+    #
+    # Attempt 1 - nprocs=8: rejected outright, "Unsupported nprocs (8).
+    #   Please use nprocs=1 or None."
+    # Attempt 2 - nprocs=None, default fork: all 8 children died in
+    #   XLAGraphExecutor::SyncLiveTensorsGraph, "Check failed:
+    #   !g_computation_client_initialized". Diagnosed (wrongly, at the time)
+    #   as fork inheriting an initialised client.
+    # Attempt 3 - start_method="spawn": IDENTICAL failure. Disproved attempt
+    #   2's diagnosis. The stack trace names PrepareToExit(), so the check
+    #   fires during teardown of a child that never initialised - the real
+    #   error, one line up, is
+    #     Could not find SliceBuilder port 8476 in any of the 0 ports
+    #     provided in `tpu_process_addresses`="local"
+    #   i.e. libtpu in single-process mode being asked to run eight.
+    # Attempt 4 - clear TPU_PROCESS_ADDRESSES/TPU_HOST_BOUNDS/TPU_WORKER_ID/
+    #   TPU_WORKER_HOSTNAMES so torch_xla derives the topology fresh: a
+    #   DIFFERENT and worse crash appeared -
+    #     File ".../torch_xla/_internal/tpu.py", line 259, in configure_topology
+    #       default_process_bounds = MeshShape.from_string(...)
+    #     File ".../tpu.py", line 73, in from_string
+    #       dims = tuple(int(d) for d in mesh.split(','))
+    #     AttributeError: 'NoneType' object has no attribute 'split'
+    #   Removing TPU_HOST_BOUNDS='1,1,1' most likely destroyed an input that
+    #   configure_topology's own derivation needed, rather than clearing an
+    #   obstruction - clearing state made this measurably worse, not better.
+    #
+    # Given four distinct failure modes from four distinct hypotheses, this is
+    # far more likely a genuine defect or an unsupported configuration in this
+    # torch_xla build on Kaggle's TPU than something fixable by more env
+    # guessing. Left OFF by default (see PATHGRADE_NPROCS default in
+    # pipeline_tpu.py) so it stops costing minutes on every chunk. A next
+    # attempt should try TPU_PROCESS_ADDRESSES alone (the one value that
+    # actually names the restriction) rather than the broad clear below, which
+    # remains opt-in for exactly that purpose.
     tpu_env = {k: v for k, v in sorted(os.environ.items())
                if k.startswith(("TPU_", "PJRT_", "XLA_", "CLOUD_TPU", "LIBTPU"))}
     print(f"TPU env before spawn: {json.dumps(tpu_env)}", flush=True)
 
-    # torch_xla configures the multiprocess topology itself, but only for keys
-    # it does not find already set. Kaggle's single-process defaults therefore
-    # win and leave the children with nowhere to bind. Clear them and let
-    # torch_xla derive the eight-way layout from scratch.
-    if os.environ.get("PATHGRADE_CLEAR_TPU_ENV", "1") == "1":
+    if os.environ.get("PATHGRADE_CLEAR_TPU_ENV") == "1":
         for key in ("TPU_PROCESS_ADDRESSES", "TPU_VISIBLE_CHIPS",
                     "TPU_VISIBLE_DEVICES", "TPU_PROCESS_BOUNDS",
                     "TPU_CHIPS_PER_PROCESS_BOUNDS", "CLOUD_TPU_TASK_ID",

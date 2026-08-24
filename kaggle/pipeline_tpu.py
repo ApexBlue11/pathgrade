@@ -97,11 +97,16 @@ DECODE_WORKERS = os.environ.get("PATHGRADE_DECODE_WORKERS", "16")
 # build_encoders also refuses to replicate on XLA. Real 8-way parallelism needs
 # one process per device, which is a separate change.
 TPU_CORES = os.environ.get("PATHGRADE_TPU_CORES", "1")
-# Processes to spawn, one per XLA device. This is the route that actually uses
-# a v5e-8: threads share one process and corrupt each other's graphs, separate
-# processes each own a chip. 8 processes x 16 decode threads also puts 128 of
-# the 224 vCPU to work instead of 16.
-NPROCS = os.environ.get("PATHGRADE_NPROCS", "8")
+# Processes to spawn, one per XLA device - OFF by default. Five real-TPU
+# attempts (see multi_extract.py) each hit a different failure inside
+# torch_xla's own multiprocess topology setup on this platform: an outright
+# rejected argument, two distinct fatal crashes in the C++ runtime, and an
+# AttributeError from a None config value after clearing environment that
+# turned out to be load-bearing. Every attempt cost about a minute because the
+# shared-budget fallback caught it, but a minute times every remaining chunk is
+# not worth paying for a path that has not once succeeded. Set to >1 to retry;
+# multi_extract.py documents exactly what to try next.
+NPROCS = os.environ.get("PATHGRADE_NPROCS", "1")
 # MEASURED, and the correction matters: download is the binding constraint, and
 # 4 was starving it. Across chunks c1/c5/c6 per-stream throughput was a steady
 # 30 MB/s, but the AGGREGATE over wall clock was only 14-17 MB/s - less than a
