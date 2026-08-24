@@ -64,6 +64,11 @@ class OptimConfig:
     # starves the run - it is steps, not epochs, that matter.
     lr: float = 5e-4
     weight_decay: float = 1e-4
+    # Exempt the attention scorer from weight decay. See build_param_groups:
+    # decay was the only force acting on the scorer once the head could fit the
+    # data from the bag mean, and it shrank the scorer below its own init in
+    # both real runs.
+    scorer_no_decay: bool = False
     epochs: int = 80
     warmup_epochs: int = 5
     batch_size: int = 8

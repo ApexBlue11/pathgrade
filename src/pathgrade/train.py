@@ -73,11 +73,23 @@ def build_param_groups(model, cfg: Config) -> list[dict]:
         "norm": m.lr_mult_norm,
         "other": 1.0,
     }
-    return [
-        {"params": params, "lr": m.lr * mult[key], "name": key}
-        for key, params in buckets.items()
-        if params
-    ]
+    # The attention scorer can be exempted from weight decay. This is not a
+    # nicety: in the first two real runs the scorer's output layer ended
+    # SMALLER than its own initialisation (std 0.018 then 0.008 against an init
+    # of ~0.036) because once the head fits the training set from the bag mean,
+    # no gradient defends the scorer and decay is the only force left acting on
+    # it. Attention collapsed to exactly uniform both times, and raising decay
+    # to fight overfitting made it strictly worse.
+    scorer_wd = 0.0 if m.scorer_no_decay else m.weight_decay
+    groups = []
+    for key, params in buckets.items():
+        if not params:
+            continue
+        g = {"params": params, "lr": m.lr * mult[key], "name": key}
+        if key == "scorer":
+            g["weight_decay"] = scorer_wd
+        groups.append(g)
+    return groups
 
 
 def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):

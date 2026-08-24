@@ -132,12 +132,20 @@ class ASMILOrdLoss(nn.Module):
         # from the bag mean, so no gradient ever asked the scorer to
         # specialise and weight decay shrank it below its own init.
         #
-        # OFF by default, and deliberately so: forcing concentration does not
-        # by itself make attention land on the *right* patches. Sharpening the
-        # collapsed scorer post-hoc was measured to LOWER accuracy, because
-        # there was no learned ranking underneath to sharpen. Treat this as one
-        # half of a fix whose other half is not overfitting, and check that CV
-        # QWK does not fall when enabling it.
+        # MEASURED NOT TO WORK, and kept only so the finding is not re-derived.
+        #
+        # Enabling it at 0.5 on a real run moved normalised attention entropy
+        # from 0.9975 to 0.9998 - i.e. attention became MORE uniform - while CV
+        # QWK fell 0.42 -> 0.39. The reason is mathematical, not a tuning
+        # problem: uniform attention is the *maximum* of entropy, so the
+        # gradient of an entropy penalty vanishes exactly where the collapse
+        # sits. There is no downhill direction to follow out of a stationary
+        # point, whatever the coefficient.
+        #
+        # Escaping uniformity needs a mechanism with a non-zero gradient there:
+        # stop decaying the scorer to death (``optim.scorer_no_decay``), scale
+        # the attention logits, or pool with something that is not flat at
+        # uniform (top-k). Leave this at 0.
         self.lambda_attn_entropy = lambda_attn_entropy
 
     def forward(

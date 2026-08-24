@@ -511,6 +511,7 @@ try:
         return default if v is None else float(v)
 
     cfg.loss.lambda_attn_entropy = _envf("PATHGRADE_ATTN_ENTROPY", cfg.loss.lambda_attn_entropy)
+    cfg.optim.scorer_no_decay = os.environ.get("PATHGRADE_SCORER_NO_DECAY") == "1"
     cfg.optim.weight_decay = _envf("PATHGRADE_WEIGHT_DECAY", cfg.optim.weight_decay)
     cfg.model.dropout = _envf("PATHGRADE_DROPOUT", cfg.model.dropout)
     if os.environ.get("PATHGRADE_SAMPLES_PER_SLIDE"):
@@ -526,7 +527,8 @@ try:
     print(f"training knobs: attn_entropy={cfg.loss.lambda_attn_entropy} "
           f"weight_decay={cfg.optim.weight_decay} dropout={cfg.model.dropout} "
           f"bag_size={cfg.data.bag_size} "
-          f"samples_per_slide={cfg.data.samples_per_slide}", flush=True)
+          f"samples_per_slide={cfg.data.samples_per_slide} "
+          f"scorer_no_decay={cfg.optim.scorer_no_decay}", flush=True)
     summary = run_cv(cfg)
 
     banner("3. LOCKED TEST SET")

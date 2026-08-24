@@ -1165,3 +1165,55 @@ def test_samples_per_slide_is_ignored_at_eval(tmp_path):
 
     ds = SlideBagDataset(ids, labels, tmp_path, bag_size=128, train=False, samples_per_slide=8)
     assert len(ds) == 2, "eval must see each slide once regardless of the training knob"
+
+
+def test_entropy_gradient_vanishes_at_uniform_attention():
+    """Why the entropy penalty could not un-collapse attention.
+
+    Uniform is the maximum of entropy, so the gradient there is ~0 and there
+    is no downhill direction out of it at any coefficient. Enabling the
+    penalty on a real run moved entropy 0.9975 -> 0.9998 (more uniform) while
+    CV QWK fell. Pinned so nobody reaches for this lever again.
+    """
+    from pathgrade.models.asmil_ord import _mean_normalised_entropy
+
+    n = 512
+    mask = torch.ones(1, n, dtype=torch.bool)
+
+    scores_uniform = torch.zeros(1, n, 1, requires_grad=True)
+    a = torch.softmax(scores_uniform, dim=1)
+    _mean_normalised_entropy(a, mask).backward()
+    grad_at_uniform = scores_uniform.grad.abs().max().item()
+
+    scores_peaked = torch.randn(1, n, 1) * 3.0
+    scores_peaked.requires_grad_(True)
+    a = torch.softmax(scores_peaked, dim=1)
+    _mean_normalised_entropy(a, mask).backward()
+    grad_when_peaked = scores_peaked.grad.abs().max().item()
+
+    assert grad_at_uniform < 1e-6, "entropy is stationary at uniform - no escape direction"
+    assert grad_when_peaked > grad_at_uniform * 100, "away from uniform there IS a gradient"
+
+
+def test_scorer_can_be_exempted_from_weight_decay():
+    """Decay was the only force acting on the scorer once the head fit the mean.
+
+    It shrank the scorer below its own initialisation in both real runs
+    (std 0.018, then 0.008, against an init of ~0.036), which is the mechanism
+    behind the uniform attention.
+    """
+    from pathgrade.config import Config
+    from pathgrade.train import build_param_groups
+
+    model = ASMILOrd(feature_dim=64, window=16, stride=8, hidden=32, n_branches=2)
+
+    cfg = Config()
+    cfg.optim.weight_decay = 0.01
+    cfg.optim.scorer_no_decay = False
+    groups = {g["name"]: g for g in build_param_groups(model, cfg)}
+    assert "weight_decay" not in groups["scorer"] or groups["scorer"]["weight_decay"] == 0.01
+
+    cfg.optim.scorer_no_decay = True
+    groups = {g["name"]: g for g in build_param_groups(model, cfg)}
+    assert groups["scorer"]["weight_decay"] == 0.0, "scorer must be exempt when asked"
+    assert "weight_decay" not in groups["head"], "the head must keep the global decay"
