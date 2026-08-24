@@ -156,6 +156,74 @@ failure mode would risk the slides that same chunk had just paid to extract.
 
 ---
 
+## Diagnosing the first real result
+
+The first full training run scored QWK 0.293 on the locked test set (0.420
+five-fold CV). That is weak, so the whole thing was taken apart against the
+435 extracted slides, the five fold checkpoints and the saved predictions.
+
+**Ruled out by measurement, not by argument:**
+
+- *Magnification.* Slides at 0.25 µm/px read 444 px regions; slides at
+  0.5 µm/px read 224 px. Both land at ~112 µm per tile, so physical scale is
+  consistent across scanners.
+- *Feature integrity.* All 435 files finite, 1536-d, real H-optimus-0 weights,
+  sensible per-slide norms.
+- *The ordinal head.* Zero rank-consistency violations across 66 test slides,
+  and 0.5 is already the near-optimal threshold - sweeping 0.3–0.7, and
+  sweeping expected-grade cuts, finds nothing better.
+- *The aggregator versus its own baseline.* A mean-pooled logistic regression
+  tuned by nested selection scores 0.251 on the same test set. The MIL model
+  scores 0.293. A broken aggregator would land at or below the trivial
+  baseline; this one beats it.
+
+**The actual defects:**
+
+**1. Attention collapsed to exactly uniform.** Top 1% of patches hold 1.0% of
+the attention mass; normalised entropy 1.0000. The model is mean-pooling, and
+the heatmap that is the product's whole explainability story is flat noise.
+
+The mechanism is worth understanding because it is a trap any MIL model on a
+small cohort can fall into. The classifier reaches near-zero training loss
+(CORN term 0.668 → 0.008) using the bag *mean* alone. Once training loss is
+flat, no gradient asks the attention scorer to specialise - and weight decay
+keeps pulling on it regardless, until its output layer ends up with smaller
+weights than it was initialised with (trained std 0.018 against an init of
+0.036). Pre-softmax scores finish with std ≈ 0.1 spread across 3000 patches,
+where a softmax needs spread on the order of log N ≈ 8 to concentrate at all.
+
+Crucially, sharpening it afterwards does not rescue it: a temperature sweep on
+the test set *lowers* QWK, because there is no learned ranking underneath to
+sharpen. Attention entropy is now computed and logged every step so this is
+visible while a run is happening, `loss.lambda_attn_entropy` can penalise
+uniformity, and `inference.attention_is_informative()` refuses to let a flat
+map be displayed as an explanation. The entropy penalty alone is explicitly
+*half* a fix - concentrating attention does not make it concentrate on the
+*right* patches; the other half is not overfitting in the first place.
+
+**2. The uncertainty score was chance.** Disagreement between the five folds
+scores AUC 0.5005 at detecting the model's own errors - mean spread 0.1583 on
+correct predictions, 0.1593 on incorrect - while being advertised as flagging
+slides for human review. Distance to the CORN decision threshold reaches AUC
+0.585 and, used to keep the most decisive half of slides, lifts QWK from 0.293
+to 0.472. That is now `GradePrediction.ambiguity`; the fold-spread field is
+kept only for provenance.
+
+**3. Validation QWK peaks at epoch 1–20 and then declines on every fold** while
+training loss keeps falling. Classic overfitting on ~350 training slides.
+
+**4. The CV number is inflated by ~0.13 QWK.** Best-epoch selection happens on
+the validation fold, and that same fold's score is then reported: CV 0.420
+against a locked-test 0.293. This is a milder instance of exactly the failure
+the evaluation discipline exists to prevent, and the honest number to quote is
+the locked-test one.
+
+The through-line: **the accuracy ceiling here is set by the features and labels,
+not the architecture**, but the *product* defects (a meaningless heatmap and a
+meaningless confidence score) were real, shipped, and are fixed.
+
+---
+
 ## What's next
 
 - External validation on a second cohort (CPTAC-HNSCC is the natural one) -

@@ -5,7 +5,7 @@ H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Encoder](https://img.shields.io/badge/encoder-H--optimus--0%20(Apache--2.0)-green.svg)](https://huggingface.co/bioptimus/H-optimus-0)
-[![Tests](https://img.shields.io/badge/tests-124%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-129%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -60,7 +60,7 @@ prediction, overlay = grade_slide("patient_042.svs", run_dir="runs/asmil-ord-hop
 print(prediction.summary())
 # G2 - moderately differentiated  (confidence 71.4%)
 #   G1 8.1%  G2 71.4%  G3 20.5%
-#   expected grade 2.12 | 7,904 patches | uncertainty 0.031
+#   expected grade 2.12 | 7,904 patches | ambiguity 0.062
 
 for r in prediction.top_regions(5):        # "review these first"
     print(r["x"], r["y"], r["attention"])
@@ -77,11 +77,18 @@ wrapper: `pathgrade.preprocessing.single_slide.encode_slide` for tiling one
 slide with the exact settings training used, then `GradePredictor.predict`,
 then `render_overlay`.
 
-A `GradePrediction` carries everything a deployment needs: the grade, a
-calibrated ordinal posterior, an **uncertainty** score from fold disagreement
-(high values flag slides for human review), and a per-patch `attention` vector
-aligned 1:1 with the `coords` written during extraction. That alignment is
-exactly why extraction stores coordinates next to features.
+A `GradePrediction` carries the grade, a calibrated ordinal posterior, an
+**ambiguity** score, and a per-patch `attention` vector aligned 1:1 with the
+`coords` written during extraction. That alignment is exactly why extraction
+stores coordinates next to features.
+
+`ambiguity` is distance to the CORN decision threshold - how close this slide
+sits to a grade boundary. It is the signal to route a review queue on. The
+older `uncertainty` field (disagreement between the five folds) is retained
+for provenance but **measured at AUC 0.500 - exactly chance - at detecting its
+own errors**, so do not gate anything on it. Ranking by `ambiguity` and keeping
+the most decisive half of slides raised QWK from 0.293 to 0.472 on the first
+real test set.
 
 ### Why this attention map is defensible
 
@@ -98,6 +105,16 @@ gradients, no perturbation, no approximation, and it survives a clinician asking
 
 Weights are averaged over all ACMIL branches and all 24 subspace ensemble
 members, so the map reflects the full ensemble rather than one arbitrary view.
+
+> **The checkpoint from the first real training run does not deliver this.**
+> Its attention is *exactly* uniform - the top 1% of patches hold 1.0% of the
+> mass, normalised entropy 1.0000 - so it is mean-pooling and the overlay is
+> flat noise. The design above is sound; the trained weights did not realise
+> it, because the head could already fit the training set from the bag mean and
+> nothing ever pushed the scorer to specialise. Call
+> `attention_is_informative(prediction)` before showing an overlay to anyone -
+> a meaningless heatmap in front of a pathologist is worse than no heatmap.
+> Cause, evidence and fix: [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
 
 Deployment path: **slide to H-optimus-0 embeddings + coords, then
 `GradePredictor.predict`, giving grade + heatmap.** Only the first stage needs a GPU.
@@ -330,6 +347,12 @@ Read plainly, not as a headline:
 - Training used **3000 patches/slide**, a number chosen to fit a Kaggle
   session rather than tuned - see [`docs/ENGINEERING.md`](docs/ENGINEERING.md)
   for why raising it stayed out of scope this round.
+- **The attention collapsed to uniform**, so this model is effectively
+  mean-pooling and the score above is what mean-pooling achieves. A tuned
+  mean-pooled logistic regression gets 0.251 on the same test set, which
+  brackets how much the aggregator is currently contributing. Fixing the
+  collapse is the first thing to try, and is diagnosed in full in
+  `docs/ENGINEERING.md`.
 - This is **one seed, one split**. Nothing here has been tuned against the
   test set - `evaluate.py` requires `--unlock` precisely so that stays true -
   but a single run is a starting point, not a validated estimate of what this
