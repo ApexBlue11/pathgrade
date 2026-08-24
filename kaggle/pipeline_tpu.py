@@ -1,20 +1,24 @@
 """End-to-end: GDC -> H-optimus-0 embeddings -> trained model -> release bundle.
 
-Extraction and training share one session on purpose. Kaggle allows a single
-concurrent TPU session and each one queues for ~20 minutes, so splitting the
-stages doubles the queue tax and forces the embeddings through a
-publish-then-remount round trip for no benefit. Together they fit comfortably
-inside the session cap: extraction is roughly two hours, training minutes.
+Extraction and training live in one script so a single kernel can do either or
+both. In practice extraction runs as a chain of short, bounded kernels rather
+than one long session - two full-cohort attempts run to completion were killed
+by the platform and lost all their output, while short bounded runs committed
+reliably. See ``../docs/ENGINEERING.md`` for why, and ``../kaggle/README.md``
+for how the chain is launched.
 
-Two failure properties matter here, because the expensive half runs first:
+Two failure properties matter, because the expensive half runs first:
 
-* **Extraction is idempotent.** Slides already present in the output are
-  skipped, so a re-run resumes rather than restarting.
+* **Extraction is idempotent and resumable.** Slides already present in the
+  output are skipped, and each kernel seeds its output from the previous
+  kernel's (mounted via ``kernel_sources``), so the chain accumulates the
+  cohort rather than restarting it.
 * **A training failure never destroys the extraction.** The training phase is
   guarded; if it raises, the traceback is printed, a FAILED marker is written,
-  and the process still exits 0 so /kaggle/working - holding several GPU-hours
-  of embeddings - is preserved as output. Check TRAINING_FAILED.txt before
-  trusting a green run.
+  and the process still exits 0 so /kaggle/working - holding hours of
+  embeddings - is preserved as output. Check TRAINING_FAILED.txt before
+  trusting a green run. ``PATHGRADE_SKIP_TRAIN=1`` skips straight past this
+  stage for an intermediate chunk that should only bank slides.
 
 Output is flushed aggressively so `kaggle kernels logs` is useful while the run
 is still going, instead of only after it ends.
@@ -91,22 +95,12 @@ BATCH_SIZE = os.environ.get("PATHGRADE_BATCH", "256")
 # oversubscription measurably hurts. Raise this only alongside real
 # multi-device encoding.
 DECODE_WORKERS = os.environ.get("PATHGRADE_DECODE_WORKERS", "16")
-# XLA devices to encode across, via threads. MEASURED BROKEN above 2: on a
-# v5e-8, 7 of 8 threads died in SyncLiveTensorsGraph and the survivors made the
-# job SLOWER than one device (68 vs 123 patches/s). Left at 1 deliberately;
-# build_encoders also refuses to replicate on XLA. Real 8-way parallelism needs
-# one process per device, which is a separate change.
+# XLA devices to encode across, via threads. MEASURED BROKEN above 2 (7 of 8
+# threads die in SyncLiveTensorsGraph, and the survivor is slower than one
+# device alone). Multi-process, one device each, was also tried and did not
+# work on this platform - see docs/ENGINEERING.md for the full record. Single
+# device is the proven path.
 TPU_CORES = os.environ.get("PATHGRADE_TPU_CORES", "1")
-# Processes to spawn, one per XLA device - OFF by default. Five real-TPU
-# attempts (see multi_extract.py) each hit a different failure inside
-# torch_xla's own multiprocess topology setup on this platform: an outright
-# rejected argument, two distinct fatal crashes in the C++ runtime, and an
-# AttributeError from a None config value after clearing environment that
-# turned out to be load-bearing. Every attempt cost about a minute because the
-# shared-budget fallback caught it, but a minute times every remaining chunk is
-# not worth paying for a path that has not once succeeded. Set to >1 to retry;
-# multi_extract.py documents exactly what to try next.
-NPROCS = os.environ.get("PATHGRADE_NPROCS", "1")
 # MEASURED, and the correction matters: download is the binding constraint, and
 # 4 was starving it. Across chunks c1/c5/c6 per-stream throughput was a steady
 # 30 MB/s, but the AGGREGATE over wall clock was only 14-17 MB/s - less than a
@@ -333,7 +327,7 @@ extract_argv = [
     "--prefetch", PREFETCH,
     "--decode-workers", DECODE_WORKERS,
     "--tpu-cores", TPU_CORES,
-    "--max-hours", "__BUDGET__",   # substituted per attempt with time remaining
+    "--max-hours", MAX_EXTRACT_HOURS,
     "--min-free-gb", "4",
     "--notify-every", "25",
 ]
@@ -396,72 +390,36 @@ print("argv:", " ".join(a for a in extract_argv if not a.startswith("http")), fl
 # slide already written, records how the child died - including the signal, so
 # a segfault is distinguishable from an exception - and still trains and
 # commits output. stdout is inherited, so per-slide progress still streams.
-child_env = {**os.environ, "PYTHONPATH": f"{SRC}/src", "PATHGRADE_NPROCS": NPROCS}
-T_EXTRACT = time.time()
+child_env = {**os.environ, "PYTHONPATH": f"{SRC}/src"}
 
-
-def budget_left() -> float:
-    """Hours still available to extraction, shared across attempts.
-
-    Both attempts draw on one budget. Without this a failed multi-device try
-    that burned the whole allowance would be followed by a single-device pass
-    with a *fresh* allowance, doubling the chunk length and pushing it into the
-    window where containers have been killed.
-    """
-    return max(0.02, float(MAX_EXTRACT_HOURS) - (time.time() - T_EXTRACT) / 3600)
-
-
-def run_extraction(module: str, label: str):
-    """Run one extraction attempt as a child. Returns (error_or_None, n_slides)."""
-    argv = [a if a != "__BUDGET__" else f"{budget_left():.3f}" for a in extract_argv]
-    cmd = [sys.executable, "-u", "-m", module] + argv
-    trail("STEP", f"{label} extraction, budget {budget_left():.2f} h")
-    err = None
-    try:
-        rc = subprocess.run(cmd, env=child_env).returncode
-        if rc is not None and rc < 0:
-            # Negative means killed by a signal: -11 SIGSEGV, -9 SIGKILL (the
-            # OOM killer). Resolving the name is best-effort - not every signal
-            # number is in the enum on every platform, and raising here, inside
-            # the handler for a crash, would lose the information we came for.
-            try:
-                import signal as _sig
-
-                name = _sig.Signals(-rc).name
-            except (ValueError, ImportError):
-                name = "unknown signal"
-            err = f"{label} child killed by {name} ({rc})"
-        elif rc not in (0, 1):
-            # 1 is the documented "finished, but some slides failed" return.
-            err = f"{label} child exited {rc}"
-    except BaseException:
-        err = traceback.format_exc()
-    n = len(list(OUT.glob("*.h5")))
-    trail("EXTRACT", f"{label} -> {n} slides total{', ERR: ' + err if err else ''}")
-    return err, n
-
-
-# Prefer one process per TPU device; fall back to the proven single-device
-# path. Threading across devices is broken (see multi_extract), but eight
-# separate processes each owning one device is the supported arrangement and
-# is worth ~8x on the stage that is 89% of per-slide time.
-#
-# The fallback is what makes trying this safe at all: extraction is idempotent,
-# so a multi-device attempt that dies having written nothing costs only the
-# minutes it ran, and the single-device pass then does the chunk as before.
+# Run as a child so a crash inside a C extension - OpenSlide and libtiff parse
+# untrusted TIFFs from hundreds of different scanners - can only take down the
+# child. Two full-cohort attempts run in-process were killed by the platform
+# outright (86 min, then 3 h 45) and produced NO output at all, not even the
+# trail file fsync'd in the first second; a bounded, child-isolated chunk of
+# under an hour is what actually committed. See docs/ENGINEERING.md.
 extract_code, extract_error = None, None
-before = len(list(OUT.glob("*.h5")))
-if int(NPROCS) > 1 and ACCEL == "xla":
-    extract_error, after = run_extraction(
-        "pathgrade.preprocessing.multi_extract", f"{NPROCS}-process")
-    if after <= before:
-        trail("FALLBACK", f"{NPROCS}-process added nothing; reverting to single device")
-        banner("MULTI-DEVICE ADDED NOTHING - falling back to single device")
-        extract_error, after = run_extraction(
-            "pathgrade.preprocessing.stream_extract", "single-device")
-else:
-    extract_error, after = run_extraction(
-        "pathgrade.preprocessing.stream_extract", "single-device")
+cmd = [sys.executable, "-u", "-m", "pathgrade.preprocessing.stream_extract"] + extract_argv
+trail("STEP", f"extraction, budget {MAX_EXTRACT_HOURS}h")
+try:
+    extract_code = subprocess.run(cmd, env=child_env).returncode
+    if extract_code is not None and extract_code < 0:
+        # Negative means killed by a signal: -11 SIGSEGV, -9 SIGKILL (the OOM
+        # killer). Resolving the name is best-effort - not every signal number
+        # is in the enum on every platform, and raising here, inside the
+        # handler for a crash, would lose the information we came for.
+        try:
+            import signal as _sig
+
+            name = _sig.Signals(-extract_code).name
+        except (ValueError, ImportError):
+            name = "unknown signal"
+        extract_error = f"extraction child killed by {name} ({extract_code})"
+    elif extract_code not in (0, 1):
+        # 1 is the documented "finished, but some slides failed" return.
+        extract_error = f"extraction child exited {extract_code}"
+except BaseException:
+    extract_error = traceback.format_exc()
 
 if extract_error:
     trail("EXTRACTION_FAILED", extract_error.strip().splitlines()[-1][:200])

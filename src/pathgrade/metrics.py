@@ -9,10 +9,13 @@ Two things are reported alongside it that usually are not:
 * **Bootstrap confidence intervals.** On a few hundred slides a QWK point
   estimate has a spread of roughly +/-0.1. Quoting three decimal places without
   an interval implies a precision the cohort cannot support.
-* **The human ceiling.** Inter-observer QWK for HNSCC grading is itself only
-  about 0.5-0.7. A model at 0.67 is not "67% of the way to solved"; it is at
-  the noise floor of its own labels, and the honest framing of that is a
-  selling point, not a weakness.
+* **The human ceiling.** Inter-observer QWK for histologic grading tends to
+  run 0.5-0.7 across several cancer types in the literature - grading is a
+  genuinely noisy label. A model at 0.67 is not "67% of the way to solved";
+  it may be at the noise floor of its own labels, and the honest framing of
+  that is a selling point, not a weakness. NOTE: the 0.5-0.7 figure below is
+  carried without a citation pinned to HNSCC specifically - verify against
+  the literature before quoting it externally.
 """
 
 from __future__ import annotations
@@ -27,7 +30,9 @@ from sklearn.metrics import (
     f1_score,
 )
 
-# Published inter-pathologist agreement for HNSCC differentiation grading.
+# Commonly-reported inter-observer agreement range for histologic grading
+# tasks generally. NOT a pinned citation for HNSCC specifically - see the
+# module docstring above.
 HUMAN_QWK_RANGE = (0.50, 0.70)
 
 
@@ -131,10 +136,10 @@ def contextualise(qwk: float) -> str:
     """One line putting a QWK next to the human agreement band."""
     lo, hi = HUMAN_QWK_RANGE
     if qwk < lo:
-        return f"QWK {qwk:.3f} is below the reported inter-pathologist band ({lo:.2f}-{hi:.2f})."
+        return f"QWK {qwk:.3f} is below the typical inter-observer band ({lo:.2f}-{hi:.2f})."
     if qwk <= hi:
         return (
-            f"QWK {qwk:.3f} sits inside the reported inter-pathologist band "
+            f"QWK {qwk:.3f} sits inside the typical inter-observer band "
             f"({lo:.2f}-{hi:.2f}) - i.e. at the label noise floor, not obviously below it."
         )
-    return f"QWK {qwk:.3f} exceeds the reported inter-pathologist band ({lo:.2f}-{hi:.2f})."
+    return f"QWK {qwk:.3f} exceeds the typical inter-observer band ({lo:.2f}-{hi:.2f})."

@@ -5,7 +5,7 @@ H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Encoder](https://img.shields.io/badge/encoder-H--optimus--0%20(Apache--2.0)-green.svg)](https://huggingface.co/bioptimus/H-optimus-0)
-[![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-124%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -46,22 +46,36 @@ Full table: `python scripts/01_extract_features.py --help`.
 
 This is the part that gets commercialised, so it leads.
 
+A production caller has one thing: a whole-slide image. Not a pre-extracted
+feature file, not a separate thumbnail. One function call covers all of it -
+tiling, encoding, prediction, and an attention overlay rendered on a
+thumbnail pulled from that same slide, so it is guaranteed to line up with
+the coordinates the attention map is drawn in:
+
 ```python
-from pathgrade.inference import GradePredictor, render_overlay
+from pathgrade.inference import grade_slide
 
-predictor = GradePredictor.from_run("runs/asmil-ord-hoptimus0")
-p = predictor.predict_file("features/TCGA-BA-4078.h5")
+prediction, overlay = grade_slide("patient_042.svs", run_dir="runs/asmil-ord-hoptimus0")
 
-print(p.summary())
+print(prediction.summary())
 # G2 - moderately differentiated  (confidence 71.4%)
 #   G1 8.1%  G2 71.4%  G3 20.5%
 #   expected grade 2.12 | 7,904 patches | uncertainty 0.031
 
-for r in p.top_regions(5):        # "review these first"
+for r in prediction.top_regions(5):        # "review these first"
     print(r["x"], r["y"], r["attention"])
 
-render_overlay(p, slide_thumbnail).save("explained.png")
+overlay.save("explained.png")
 ```
+
+Or as a CLI: `python scripts/05_predict_slide.py patient_042.svs --run-dir runs/asmil-ord-hoptimus0`.
+
+If features are already extracted - the cohort pipeline below writes them -
+`GradePredictor.predict_file("features/TCGA-BA-4078.h5")` skips straight to
+prediction without re-tiling. `grade_slide` is the thin, deployment-shaped
+wrapper: `pathgrade.preprocessing.single_slide.encode_slide` for tiling one
+slide with the exact settings training used, then `GradePredictor.predict`,
+then `render_overlay`.
 
 A `GradePrediction` carries everything a deployment needs: the grade, a
 calibrated ordinal posterior, an **uncertainty** score from fold disagreement
@@ -203,13 +217,14 @@ PyTorch runs on TPU via `torch_xla`; pass `--device xla`. Two details matter:
 - **XLA compiles one graph per input shape.** A ragged final batch would
   recompile on every slide, so batches are padded to a constant size and sliced
   after. Keep `--batch-size` fixed.
-- **Sharding doubles as core assignment.** `--shard i --num-shards n` splits
-  slides across parallel sessions; the same flag assigns work per core under
-  `xmp.spawn`.
+- **`--shard i --num-shards n` splits slides across separate Kaggle sessions**,
+  not across the eight XLA devices within one session - encoding across
+  devices in a single process was tried and did not work out on this
+  platform; see [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
 
-Since the job is download-bound, TPU buys roughly 2.7 h versus 6.1 h on 2×T4 —
-real, but not decisive. The bigger win is running TPU *and* GPU sessions
-concurrently on different shards, which uses two separate Kaggle quotas at once.
+A single TPU session cannot run the full cohort in one sitting without risking
+the whole run: see the survivability notes in the same file for why extraction
+runs as a chain of short, resumable sessions rather than one long one.
 
 **2. Build splits** — patient-level, with a locked test set.
 
@@ -227,6 +242,12 @@ python scripts/03_train_cv.py --config configs/hnsc_hoptimus0.yaml
 
 ```bash
 python scripts/04_evaluate_test.py --run-dir runs/asmil-ord-hoptimus0 --unlock
+```
+
+**5. Predict** — one slide, end to end. This is the path a deployment takes.
+
+```bash
+python scripts/05_predict_slide.py patient_042.svs --run-dir runs/asmil-ord-hoptimus0
 ```
 
 ---
@@ -272,22 +293,54 @@ loss of accuracy.
 
 ### Read the number honestly
 
-Inter-pathologist QWK for HNSCC differentiation grading is itself only about
-**0.50–0.70**. A model scoring 0.67 is not "67% of the way to solved" — it is at
-the noise floor of its own labels. `metrics.contextualise()` prints this next to
-every result. Framed correctly it is a selling point; framed as "beats
-pathologists" it will not survive scrutiny.
+Inter-observer agreement on histologic grading tends to run **0.50–0.70** QWK
+across several cancer types in the grading literature - grading is a
+genuinely noisy label, not a ground truth with a single right answer.
+`metrics.contextualise()` prints this range next to every result as context,
+not as a benchmark to beat. **This specific 0.50–0.70 figure is carried in
+this repo without a pinned citation for HNSCC specifically** and should be
+verified against the literature before it appears in anything external. A
+model scoring 0.67 should not be framed as "67% of the way to solved," and
+should certainly not be framed as "beats pathologists" without a citation
+that survives scrutiny.
 
 ---
 
 ## Status and limitations
 
-- **Not validated on real data yet.** The pipeline is verified end-to-end on
-  synthetic MIL data with a known signal (43 passing tests). Real TCGA-HNSC
-  numbers require running steps 1–4 on actual slides.
+**First real result, TCGA-HNSC, 435 slides, one locked test set, one seed:**
+
+| | QWK | macro-F1 | balanced acc. | adjacent acc. |
+|---|---|---|---|---|
+| 5-fold CV (mean ± std) | 0.420 ± 0.073 | 0.514 | 0.534 | 0.989 |
+| Locked test (n=66) | **0.293** [0.05, 0.50] 95% CI | 0.463 | 0.468 | 0.970 |
+
+Read plainly, not as a headline:
+
+- The test QWK sits **below** the typical inter-observer band this repo cites
+  above, and its 95% CI is wide (a direct consequence of 66 test slides) -
+  the honest statement is "not yet at reported human agreement, and not
+  precisely enough measured to say by how much."
+- **Adjacent accuracy near 97–99%** means the model is very rarely off by more
+  than one grade even when it misses the exact class - errors are ordinal
+  drift, not gross misclassification. That is the CORN head doing its job.
+- The class split is uneven (G1 56 / G2 265 / G3 114); the confusion matrix
+  shows G1 recall (3/9 in test) is the weakest cell, consistent with that
+  imbalance rather than a modelling failure specific to G1.
+- Training used **3000 patches/slide**, a number chosen to fit a Kaggle
+  session rather than tuned - see [`docs/ENGINEERING.md`](docs/ENGINEERING.md)
+  for why raising it stayed out of scope this round.
+- This is **one seed, one split**. Nothing here has been tuned against the
+  test set - `evaluate.py` requires `--unlock` precisely so that stays true -
+  but a single run is a starting point, not a validated estimate of what this
+  architecture can do.
+
+Also true:
+
 - **No external validation.** Single-cohort CV overstates deployability.
   CPTAC-HNSCC is the obvious second cohort.
-- **TCGA grade labels are noisy** and G1/G4 are rare, which caps achievable QWK.
+- **TCGA grade labels are noisy** and G1/G4 are rare, which caps achievable QWK
+  independent of model quality.
 - **This is not a medical device.** A tumour grading product is regulated: FDA
   510(k)/De Novo in the US, IVDR Class C in the EU, UKCA in the UK. Budget for it.
 - Licence status was verified August 2026 and can change. Re-verify before any
