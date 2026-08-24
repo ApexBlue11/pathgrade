@@ -259,6 +259,38 @@ def _resize_nearest(grid: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return grid[np.ix_(ys, xs)]
 
 
+def grade_slide(
+    slide_path: str | Path,
+    run_dir: str | Path,
+    device=None,
+    thumbnail_px: int = 1536,
+    **encode_kwargs,
+) -> tuple[GradePrediction, "object"]:
+    """The whole commercial path: a raw slide in, a grade and an overlay out.
+
+    This is the only entry point a deployment needs to call. A user uploads
+    one whole-slide image - nothing else. There is no separate thumbnail to
+    supply: the overlay is rendered on a thumbnail pulled from the same slide
+    file this function tiles, so it is guaranteed to line up with the
+    coordinates the attention map is drawn in. There is no pre-extraction
+    step either - tiling and encoding happen here, with the exact settings
+    training used (see :func:`pathgrade.preprocessing.single_slide.encode_slide`).
+
+    Returns ``(prediction, overlay_image)``. ``overlay_image`` is a PIL image;
+    save it directly with ``overlay.save(...)``.
+    """
+    from .preprocessing.single_slide import encode_slide, slide_thumbnail
+
+    features, coords, attrs = encode_slide(slide_path, device=device or "auto", **encode_kwargs)
+    predictor = GradePredictor.from_run(run_dir, device=device)
+    prediction = predictor.predict(
+        features, coords, patch_size=attrs["level0_px"], metadata=attrs,
+    )
+    thumb = slide_thumbnail(slide_path, max_px=thumbnail_px)
+    overlay = render_overlay(prediction, thumb)
+    return prediction, overlay
+
+
 def render_overlay(
     prediction: GradePrediction,
     thumbnail,

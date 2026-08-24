@@ -918,3 +918,152 @@ def test_multi_extract_worker_survives_a_dead_shard(monkeypatch, capsys):
     monkeypatch.setattr("pathgrade.preprocessing.stream_extract.run", boom)
     me._worker(3, ["--out-dir", "/tmp/f"])         # must not raise
     assert "shard 3" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Single-slide inference path: encode_slide / slide_thumbnail / grade_slide
+#
+# The commercial deployment never runs the cohort extraction CLI - it grades
+# one uploaded slide and needs a grade plus an attention overlay back, with
+# no separate thumbnail file. These pin the wiring between tiling, the shared
+# encode_tiles used by cohort extraction, and GradePredictor.
+# --------------------------------------------------------------------------
+class _FakeOpenSlide:
+    """Stands in for openslide.OpenSlide - never touches a real file."""
+
+    closed = False
+
+    def __init__(self, path):
+        self.path = path
+
+    def close(self):
+        self.closed = True
+
+
+class _StubEncoder:
+    """Lightweight stand-in for PatchEncoder - avoids building a real 1B-param
+    ViT-g just to test that encode_slide wires its arguments correctly."""
+
+    def __init__(self, spec, device=None, random_weights=False):
+        self.spec = spec
+        self.is_xla = False
+
+    def build_transform(self):
+        return lambda t: t
+
+
+def test_encode_slide_returns_extraction_shaped_output(monkeypatch):
+    from pathgrade.preprocessing import single_slide as ss
+
+    monkeypatch.setattr("openslide.OpenSlide", _FakeOpenSlide)
+    monkeypatch.setattr(ss, "PatchEncoder", _StubEncoder)
+    monkeypatch.setattr(ss, "build_grid", lambda *a, **k: _FakeGrid(37))
+
+    def fake_encode_tiles(slide, grid, encoder, transform, batch_size, **kw):
+        assert isinstance(slide, _FakeOpenSlide)
+        return np.zeros((len(grid.coords), encoder.spec.embed_dim), dtype=np.float32)
+
+    monkeypatch.setattr(ss, "encode_tiles", fake_encode_tiles)
+
+    feats, coords, attrs = ss.encode_slide("fake.svs", device="cpu")
+
+    assert feats.shape == (37, 1536)
+    assert coords.shape == (37, 2)
+    assert attrs["encoder"] == "h-optimus-0"
+    assert attrs["n_patches"] == 37
+    assert attrs["encoder_licence"] == "Apache-2.0"
+
+
+def test_encode_slide_closes_the_slide_even_on_failure(monkeypatch):
+    """A tiling error must not leak an open OpenSlide handle."""
+    from pathgrade.preprocessing import single_slide as ss
+
+    opened = {}
+
+    class TrackedSlide(_FakeOpenSlide):
+        def __init__(self, path):
+            super().__init__(path)
+            opened["handle"] = self
+
+    monkeypatch.setattr("openslide.OpenSlide", TrackedSlide)
+    monkeypatch.setattr(ss, "PatchEncoder", _StubEncoder)
+
+    def explode(*a, **k):
+        raise RuntimeError("corrupt tile")
+
+    monkeypatch.setattr(ss, "build_grid", explode)
+
+    with pytest.raises(RuntimeError, match="corrupt tile"):
+        ss.encode_slide("fake.svs", device="cpu")
+    assert opened["handle"].closed, "slide must be closed even when tiling raises"
+
+
+def test_encode_slide_rejects_a_slide_with_no_tissue(monkeypatch):
+    from pathgrade.preprocessing import single_slide as ss
+
+    monkeypatch.setattr("openslide.OpenSlide", _FakeOpenSlide)
+    monkeypatch.setattr(ss, "PatchEncoder", _StubEncoder)
+    monkeypatch.setattr(ss, "build_grid", lambda *a, **k: _FakeGrid(0))
+
+    with pytest.raises(ValueError, match="no tissue"):
+        ss.encode_slide("fake.svs", device="cpu")
+
+
+def test_slide_thumbnail_scales_to_the_requested_max_side(monkeypatch):
+    from pathgrade.preprocessing import single_slide as ss
+
+    class Sized(_FakeOpenSlide):
+        level_dimensions = [(4000, 2000)]
+
+        def get_thumbnail(self, size):
+            return size          # return the requested size for inspection
+
+    monkeypatch.setattr("openslide.OpenSlide", Sized)
+    size = ss.slide_thumbnail("fake.svs", max_px=1000)
+    assert size == (1000, 500), "aspect ratio must be preserved when scaling to max_px"
+
+
+def test_grade_slide_wires_encode_predict_and_overlay_together(monkeypatch):
+    """The one call a deployment makes: slide in, (prediction, image) out."""
+    from pathgrade import inference as inf
+
+    n = 20
+    coords = np.stack([np.arange(n) * 10, np.zeros(n, dtype=int)], axis=1)
+    attrs = {"level0_px": 224, "n_patches": n}
+
+    monkeypatch.setattr(
+        "pathgrade.preprocessing.single_slide.encode_slide",
+        lambda path, device=None, **kw: (
+            np.random.default_rng(0).standard_normal((n, 8)).astype(np.float32),
+            coords, attrs,
+        ),
+    )
+    monkeypatch.setattr(
+        "pathgrade.preprocessing.single_slide.slide_thumbnail",
+        lambda path, max_px=1536: __import__("PIL.Image", fromlist=["Image"]).new(
+            "RGB", (64, 64)),
+    )
+
+    class _Model:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, x, mask):
+            import types
+
+            return types.SimpleNamespace(logits=torch.zeros(1, 2))
+
+        def patch_attention(self, x, mask):
+            return torch.ones(1, n) / n
+
+    predictor = inf.GradePredictor([_Model()], config=type(
+        "C", (), {"model": type("M", (), {"feature_dim": 8})()})(), device=torch.device("cpu"))
+    monkeypatch.setattr(inf.GradePredictor, "from_run", classmethod(lambda cls, *a, **k: predictor))
+
+    prediction, overlay = inf.grade_slide("fake.svs", "runs/whatever")
+
+    assert prediction.n_patches == n
+    assert overlay.size == (64, 64)
