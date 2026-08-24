@@ -172,7 +172,8 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
         ema_decay=cfg.model.ema_decay, feature_norm=cfg.model.feature_norm,
     ).to(device)
 
-    criterion = ASMILOrdLoss(d.n_classes, cfg.loss.beta, cfg.loss.gamma, cfg.loss.lambda_qwk)
+    criterion = ASMILOrdLoss(d.n_classes, cfg.loss.beta, cfg.loss.gamma,
+                             cfg.loss.lambda_qwk, cfg.loss.lambda_attn_entropy)
     # LambdaLR scales each group's own base_lr, so per-group multipliers survive
     # the warmup + cosine schedule.
     optimizer = torch.optim.AdamW(

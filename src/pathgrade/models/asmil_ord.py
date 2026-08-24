@@ -162,6 +162,12 @@ class ASMILOrd(nn.Module):
         if stab_terms:
             aux["stabilisation"] = torch.stack(stab_terms).mean()
             aux["diversity"] = torch.stack(div_terms).mean()
+            # Normalised attention entropy, 1.0 when attention is exactly
+            # uniform. Reported so a collapsed scorer is visible in the
+            # training log rather than only discoverable months later by
+            # measuring a finished checkpoint - which is how the first real
+            # run's flat attention map was actually found.
+            aux["attn_entropy"] = _mean_normalised_entropy(attn_ref, mask)
 
         return MILOutput(logits=logits, attention=attn_ref, bag_embedding=bag_ref, aux=aux)
 
@@ -206,3 +212,21 @@ def branch_diversity(alpha: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     sim = torch.einsum("bnk,bnj->bkj", a, a)                    # [B, K, K]
     off_diag = ~torch.eye(k, dtype=torch.bool, device=a.device)
     return sim[:, off_diag].mean()
+
+
+def _mean_normalised_entropy(alpha: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Attention entropy in [0, 1], averaged over bags and branches.
+
+    1.0 means attention is exactly uniform over the bag - the model is
+    mean-pooling and the heatmap carries no information. The first real
+    training run sat at 1.0000 to four decimals without anything noticing,
+    because nothing was measuring it.
+
+    Normalising by log(N) makes bags of different sizes comparable, which
+    matters here since slides range from tens to thousands of patches.
+    """
+    a = alpha.masked_fill(~mask.unsqueeze(-1), 0.0)
+    a = a / a.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    ent = -(a * (a + 1e-12).log()).sum(dim=1)                 # [B, K]
+    n = mask.sum(dim=1).clamp_min(2).log().unsqueeze(-1)      # [B, 1]
+    return (ent / n).mean()

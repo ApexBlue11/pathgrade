@@ -1023,3 +1023,96 @@ def test_grade_slide_wires_encode_predict_and_overlay_together(monkeypatch):
 
     assert prediction.n_patches == n
     assert overlay.size == (64, 64)
+
+
+# --------------------------------------------------------------------------
+# Attention collapse: the failure that shipped once and must not ship again
+#
+# The first real training run ended with attention EXACTLY uniform - top 1% of
+# patches holding 1.0% of the mass, normalised entropy 1.0000 - so the model
+# was mean-pooling and the heatmap sold as the product's explanation was flat
+# noise. Nothing detected it because nothing was measuring it.
+# --------------------------------------------------------------------------
+def test_attention_guard_rejects_a_uniform_map():
+    """A flat heatmap must be refused, not rendered as an explanation."""
+    from pathgrade.inference import GradePrediction, attention_is_informative
+
+    n = 3000
+    pred = GradePrediction(
+        grade=1, grade_label="G2", probabilities=np.array([0.2, 0.6, 0.2]),
+        cumulative=np.array([0.87, 0.28]), confidence=0.6,
+        attention=np.ones(n) / n, coords=np.zeros((n, 2), dtype=int),
+        patch_size=224, n_patches=n,
+    )
+    ok, reason = attention_is_informative(pred)
+    assert not ok
+    assert "uniform" in reason.lower()
+
+
+def test_attention_guard_accepts_a_concentrated_map():
+    from pathgrade.inference import GradePrediction, attention_is_informative
+
+    n = 3000
+    a = np.ones(n)
+    a[:30] = 200.0                       # top 1% carries most of the mass
+    pred = GradePrediction(
+        grade=1, grade_label="G2", probabilities=np.array([0.2, 0.6, 0.2]),
+        cumulative=np.array([0.87, 0.28]), confidence=0.6,
+        attention=a, coords=np.zeros((n, 2), dtype=int), patch_size=224, n_patches=n,
+    )
+    ok, _ = attention_is_informative(pred)
+    assert ok
+
+
+def test_model_reports_attention_entropy_so_collapse_is_visible_in_training():
+    """Uniform attention must show as entropy ~1.0 in the training log."""
+    from pathgrade.models.asmil_ord import _mean_normalised_entropy
+
+    b, n, k = 2, 512, 5
+    mask = torch.ones(b, n, dtype=torch.bool)
+
+    uniform = torch.full((b, n, k), 1.0 / n)
+    assert _mean_normalised_entropy(uniform, mask).item() == pytest.approx(1.0, abs=1e-3)
+
+    peaked = torch.full((b, n, k), 1e-6)
+    peaked[:, 0, :] = 1.0
+    assert _mean_normalised_entropy(peaked, mask).item() < 0.2
+
+
+def test_ambiguity_beats_fold_spread_at_flagging_a_borderline_slide():
+    """The shipped `uncertainty` scored AUC 0.500 at detecting its own errors.
+
+    `ambiguity` is distance to the CORN decision threshold, which is what
+    actually separates a decisive call from a coin flip.
+    """
+    from pathgrade.inference import GradePrediction
+
+    def mk(cum):
+        return GradePrediction(
+            grade=1, grade_label="G2", probabilities=np.array([0.2, 0.6, 0.2]),
+            cumulative=np.array(cum), confidence=0.6, attention=np.ones(10) / 10,
+            coords=np.zeros((10, 2), dtype=int), patch_size=224, n_patches=10,
+        )
+
+    decisive = mk([0.97, 0.03])
+    borderline = mk([0.51, 0.49])
+    assert decisive.ambiguity < 0.05
+    assert borderline.ambiguity > 0.45
+    assert borderline.ambiguity > decisive.ambiguity
+
+
+def test_entropy_penalty_is_off_by_default_but_reports_raw_entropy():
+    """Enabling the penalty must be a deliberate act, but the number is always logged."""
+    from pathgrade.losses import ASMILOrdLoss
+
+    logits = torch.zeros(4, 2, requires_grad=True)
+    targets = torch.tensor([0, 1, 2, 1])
+    aux = {"stabilisation": torch.tensor(0.01), "diversity": torch.tensor(0.1),
+           "attn_entropy": torch.tensor(0.97)}
+
+    _, parts = ASMILOrdLoss(3).forward(logits, targets, aux)
+    assert "attn_entropy" not in parts, "penalty must default to off"
+    assert parts["attn_entropy_raw"] == pytest.approx(0.97), "raw entropy always reported"
+
+    _, parts = ASMILOrdLoss(3, lambda_attn_entropy=0.5).forward(logits, targets, aux)
+    assert parts["attn_entropy"] == pytest.approx(0.5 * 0.97)

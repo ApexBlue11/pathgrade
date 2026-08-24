@@ -119,12 +119,26 @@ class ASMILOrdLoss(nn.Module):
         beta: float = 1.0,
         gamma: float = 0.1,
         lambda_qwk: float = 0.0,
+        lambda_attn_entropy: float = 0.0,
     ):
         super().__init__()
         self.n_classes = n_classes
         self.beta = beta
         self.gamma = gamma
         self.lambda_qwk = lambda_qwk
+        # Penalises attention for staying uniform. The first real training run
+        # ended with normalised attention entropy at 1.0000 - literally
+        # mean-pooling - because the head could already fit the training set
+        # from the bag mean, so no gradient ever asked the scorer to
+        # specialise and weight decay shrank it below its own init.
+        #
+        # OFF by default, and deliberately so: forcing concentration does not
+        # by itself make attention land on the *right* patches. Sharpening the
+        # collapsed scorer post-hoc was measured to LOWER accuracy, because
+        # there was no learned ranking underneath to sharpen. Treat this as one
+        # half of a fix whose other half is not overfitting, and check that CV
+        # QWK does not fall when enabling it.
+        self.lambda_attn_entropy = lambda_attn_entropy
 
     def forward(
         self,
@@ -151,6 +165,14 @@ class ASMILOrdLoss(nn.Module):
             parts["stabilisation"] = self.beta * aux["stabilisation"]
         if self.gamma > 0 and "diversity" in aux:
             parts["diversity"] = self.gamma * aux["diversity"]
+        if self.lambda_attn_entropy > 0 and "attn_entropy" in aux:
+            parts["attn_entropy"] = self.lambda_attn_entropy * aux["attn_entropy"]
 
         total = torch.stack(list(parts.values())).sum()
-        return total, {k: float(v.detach()) for k, v in parts.items()}
+        reported = {k: float(v.detach()) for k, v in parts.items()}
+        # Always surface the raw entropy, even when the penalty is off, so a
+        # collapsing scorer shows up in the training log while the run is still
+        # happening instead of after the fact.
+        if "attn_entropy" in aux:
+            reported.setdefault("attn_entropy_raw", float(aux["attn_entropy"].detach()))
+        return total, reported

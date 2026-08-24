@@ -40,6 +40,10 @@ class LossConfig:
     beta: float = 1.0        # ASMIL attention stabilisation
     gamma: float = 0.1       # ACMIL branch diversity
     lambda_qwk: float = 0.2  # soft-QWK auxiliary
+    # Penalty on uniform attention. 0 = off (what the first real run used, and
+    # it collapsed to exact mean-pooling). See ASMILOrdLoss for why this is not
+    # a standalone fix.
+    lambda_attn_entropy: float = 0.0
 
     # Bag MixUp: swaps whole patches between slides (never interpolates
     # features) and interpolates the ordinal target. Off by default; enable

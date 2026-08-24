@@ -3,7 +3,7 @@
 **This is the product surface.** Everything else in the repo exists to produce
 the weights this module loads. A deployment takes a slide, encodes it with
 H-optimus-0, and calls :meth:`GradePredictor.predict`, which returns a grade,
-calibrated ordinal probabilities, an uncertainty estimate, and a per-patch
+calibrated ordinal probabilities, an ambiguity score, and a per-patch
 attention map that can be drawn straight over the slide thumbnail.
 
 The attention map is the part a pathologist will actually interrogate, so it is
@@ -26,6 +26,27 @@ so it reflects the full ensemble rather than one arbitrary view.
 Because extraction stores patch coordinates alongside features, every attention
 value maps back to a precise region of the original slide - see
 :func:`attention_to_grid`.
+
+.. warning::
+
+   **The attention map from the first real training run is uniform and carries
+   no information.** Measured on real test slides: the top 1% of patches hold
+   1.0% of the attention mass and normalised entropy is 1.0000 - identical to
+   averaging every patch equally. ``top_regions()`` on such a checkpoint
+   returns arbitrary tiles, and a rendered overlay is flat noise dressed up as
+   an explanation, which is worse than showing nothing.
+
+   The cause is not the code in this module. The trained model reached ~0
+   training loss by mean-pooling alone, so nothing ever pushed the attention
+   scorer to specialise, and weight decay then shrank its output layer below
+   its own initialisation (pre-softmax score std ~0.1 across 3000 patches,
+   where softmax needs a spread of order log N ~ 8 to concentrate at all).
+   Sharpening it after the fact does not help - it amplifies noise and
+   *lowers* accuracy - because there is no learned ranking underneath to
+   sharpen.
+
+   ``attention_is_informative()`` below checks this. **Call it before showing
+   an overlay to anyone**, and see ``docs/ENGINEERING.md`` for the fix.
 """
 
 from __future__ import annotations
@@ -67,6 +88,31 @@ class GradePrediction:
         """Continuous grade, useful when a slide sits between categories."""
         return float((self.probabilities * np.arange(len(self.probabilities))).sum())
 
+    @property
+    def ambiguity(self) -> float:
+        """How close this slide sits to a grade boundary. 0 = decisive, 0.5 = a coin flip.
+
+        Use this, not :attr:`uncertainty`, to decide what a human should review.
+
+        CORN predicts a grade by counting how many cumulative probabilities
+        P(y > j) clear 0.5, so a slide whose nearest cumulative sits *at* 0.5 is
+        one rounding error away from a different grade. That distance is the
+        honest measure of "the model is unsure".
+
+        Measured on the 66-slide locked test set of the first real training run:
+
+            signal                    AUC at detecting its own errors
+            fold disagreement          0.500   <- i.e. chance
+            posterior entropy          0.541
+            distance to threshold      0.585
+
+        Ranking by this and keeping the most decisive half lifted QWK from
+        0.293 to 0.472, which is what a review-queue is for. It is a weak
+        detector in absolute terms and is not a safety mechanism - but it is
+        the only one of the three that carries any signal at all.
+        """
+        return float(0.5 - np.abs(np.asarray(self.cumulative) - 0.5).min())
+
     def top_regions(self, k: int = 10) -> list[dict]:
         """The k highest-attention patches, for a 'review these first' list."""
         order = np.argsort(-self.attention)[:k]
@@ -90,7 +136,8 @@ class GradePrediction:
             f"{self.grade_label}  (confidence {self.confidence:.1%})\n"
             f"  {probs}\n"
             f"  expected grade {self.expected_grade:.2f} | "
-            f"{self.n_patches:,} patches | uncertainty {self.uncertainty:.3f}"
+            f"{self.n_patches:,} patches | ambiguity {self.ambiguity:.3f} "
+            f"(fold spread {self.uncertainty:.3f})"
         )
 
 
@@ -173,6 +220,9 @@ class GradePredictor:
 
         cum = np.mean(cums, axis=0)
         # Disagreement between folds: high values mark slides worth a second look.
+        # Kept for provenance, but do NOT gate review on this: measured at AUC
+        # 0.500 - exactly chance - at detecting its own errors on the first real
+        # test set. `GradePrediction.ambiguity` is the signal that works.
         uncertainty = float(np.mean(np.std(cums, axis=0))) if len(cums) > 1 else 0.0
 
         attention = np.mean(attentions, axis=0)
@@ -257,6 +307,48 @@ def _resize_nearest(grid: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     ys = np.clip((np.arange(h) * grid.shape[0] / h).astype(int), 0, grid.shape[0] - 1)
     xs = np.clip((np.arange(w) * grid.shape[1] / w).astype(int), 0, grid.shape[1] - 1)
     return grid[np.ix_(ys, xs)]
+
+
+def attention_is_informative(
+    prediction: "GradePrediction", min_top1_share: float = 2.0
+) -> tuple[bool, str]:
+    """Is this attention map worth showing to a human, or is it uniform noise?
+
+    A guard, not a metric. The first real training run produced attention that
+    was *exactly* uniform - top 1% of patches holding 1.0% of the mass - which
+    renders as a flat wash that looks like an explanation and is not one.
+    Shipping that to a pathologist is worse than shipping no heatmap at all,
+    so a deployment should call this before displaying an overlay.
+
+    Args:
+        min_top1_share: percent of total attention the top 1% of patches must
+            hold. Uniform gives exactly 1.0; the default of 2.0 demands only
+            that the model concentrates twice as hard as chance, which is a
+            deliberately low bar to clear.
+
+    Returns ``(ok, reason)``.
+    """
+    a = np.asarray(prediction.attention, dtype=np.float64)
+    n = a.size
+    if n == 0:
+        return False, "no patches"
+    total = a.sum()
+    if not np.isfinite(total) or total <= 0:
+        return False, "attention does not sum to a positive finite value"
+    a = a / total
+
+    k = max(1, n // 100)
+    top1 = float(np.sort(a)[::-1][:k].sum() * 100.0)
+    entropy_ratio = float(-(a * np.log(a + 1e-12)).sum() / np.log(n)) if n > 1 else 0.0
+
+    if top1 < min_top1_share:
+        return False, (
+            f"attention is effectively uniform: top 1% of patches hold {top1:.2f}% "
+            f"of the mass (uniform = 1.00%, required >= {min_top1_share:.2f}%), "
+            f"normalised entropy {entropy_ratio:.4f}. This heatmap is not an "
+            f"explanation - do not display it."
+        )
+    return True, f"top 1% hold {top1:.2f}% of attention, normalised entropy {entropy_ratio:.4f}"
 
 
 def grade_slide(
