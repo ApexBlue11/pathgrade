@@ -18,6 +18,9 @@ class DataConfig:
     labels_csv: str = "data/tcga_hnsc_labels.csv"
     splits_path: str = "data/splits.json"
     bag_size: int | None = None      # None -> suggest_bag_size() from the cohort
+    # Sub-bags drawn per slide per training epoch. 1 reproduces the first real
+    # run, which saw only ~348 samples per fold and memorised them.
+    samples_per_slide: int = 1
     n_classes: int = 3
     class_names: list[str] = field(default_factory=lambda: ["G1", "G2", "G3"])
 

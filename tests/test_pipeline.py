@@ -1116,3 +1116,52 @@ def test_entropy_penalty_is_off_by_default_but_reports_raw_entropy():
 
     _, parts = ASMILOrdLoss(3, lambda_attn_entropy=0.5).forward(logits, targets, aux)
     assert parts["attn_entropy"] == pytest.approx(0.5 * 0.97)
+
+
+def test_samples_per_slide_multiplies_the_training_set(tmp_path):
+    """348 samples/epoch is what let the model memorise the cohort.
+
+    Each slide holds several disjoint sub-bags; drawing more than one per
+    epoch is real augmentation (different tissue, same label), not resampling.
+    """
+    from pathgrade.data.dataset import SlideBagDataset
+
+    rng = np.random.default_rng(0)
+    ids = [f"P{i}" for i in range(6)]
+    labels = {p: i % 3 for i, p in enumerate(ids)}
+    for p in ids:
+        write_features(tmp_path / f"{p}.h5",
+                       rng.standard_normal((800, 32)).astype(np.float16),
+                       rng.integers(0, 999, (800, 2)).astype(np.int64),
+                       {"encoder": "h-optimus-0", "embed_dim": 32}, "h5")
+
+    one = SlideBagDataset(ids, labels, tmp_path, bag_size=128, train=True)
+    four = SlideBagDataset(ids, labels, tmp_path, bag_size=128, train=True, samples_per_slide=4)
+    assert len(one) == 6
+    assert len(four) == 24, "4 sub-bags per slide should quadruple the epoch"
+
+    # class balance must be preserved, or balanced sampling breaks
+    from collections import Counter
+    assert Counter(four.label_list) == {k: v * 4 for k, v in Counter(one.label_list).items()}
+
+    # and the drawn bags must actually differ, otherwise it is just duplication
+    a, b = four[0]["features"].numpy(), four[1]["features"].numpy()
+    assert four[0]["patient_id"] == four[1]["patient_id"], "same slide, two draws"
+    assert not np.array_equal(a, b), "repeated draws must sample different patches"
+
+
+def test_samples_per_slide_is_ignored_at_eval(tmp_path):
+    """Evaluation must stay deterministic and use every patch exactly once."""
+    from pathgrade.data.dataset import SlideBagDataset
+
+    rng = np.random.default_rng(1)
+    ids = ["P0", "P1"]
+    labels = {p: 1 for p in ids}
+    for p in ids:
+        write_features(tmp_path / f"{p}.h5",
+                       rng.standard_normal((400, 32)).astype(np.float16),
+                       rng.integers(0, 999, (400, 2)).astype(np.int64),
+                       {"encoder": "h-optimus-0", "embed_dim": 32}, "h5")
+
+    ds = SlideBagDataset(ids, labels, tmp_path, bag_size=128, train=False, samples_per_slide=8)
+    assert len(ds) == 2, "eval must see each slide once regardless of the training knob"

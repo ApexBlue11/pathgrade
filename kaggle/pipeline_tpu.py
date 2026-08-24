@@ -500,6 +500,33 @@ try:
     cfg.data.splits_path = str(splits_path)
     cfg.optim.num_workers = 16     # features are RAM-cached; this is cheap
     cfg.optim.amp = False
+
+    # Env-overridable knobs, for testing the fix to the attention collapse
+    # without editing and re-publishing the library. The first real run left
+    # attention exactly uniform because the head reached ~0 training loss from
+    # the bag mean alone, so nothing ever asked the scorer to specialise; these
+    # are the levers on that. Defaults reproduce that original run exactly.
+    def _envf(name, default):
+        v = os.environ.get(name)
+        return default if v is None else float(v)
+
+    cfg.loss.lambda_attn_entropy = _envf("PATHGRADE_ATTN_ENTROPY", cfg.loss.lambda_attn_entropy)
+    cfg.optim.weight_decay = _envf("PATHGRADE_WEIGHT_DECAY", cfg.optim.weight_decay)
+    cfg.model.dropout = _envf("PATHGRADE_DROPOUT", cfg.model.dropout)
+    if os.environ.get("PATHGRADE_SAMPLES_PER_SLIDE"):
+        # Multiplies training samples per epoch. The first run saw ~348 samples
+        # per fold and drove training loss to ~0; each slide holds several
+        # disjoint sub-bags that are legitimately different views of one label.
+        cfg.data.samples_per_slide = int(os.environ["PATHGRADE_SAMPLES_PER_SLIDE"])
+    if os.environ.get("PATHGRADE_BAG_SIZE"):
+        # Smaller bags make the bag mean a noisier estimate, which is the
+        # structural reason attention had nothing to add: at 1536 of ~3000
+        # patches, any two subsets have nearly the same mean.
+        cfg.data.bag_size = int(os.environ["PATHGRADE_BAG_SIZE"])
+    print(f"training knobs: attn_entropy={cfg.loss.lambda_attn_entropy} "
+          f"weight_decay={cfg.optim.weight_decay} dropout={cfg.model.dropout} "
+          f"bag_size={cfg.data.bag_size} "
+          f"samples_per_slide={cfg.data.samples_per_slide}", flush=True)
     summary = run_cv(cfg)
 
     banner("3. LOCKED TEST SET")

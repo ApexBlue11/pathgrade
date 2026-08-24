@@ -143,7 +143,8 @@ def train_fold(cfg: Config, fold: int, train_ids, val_ids, labels, device) -> tu
     set_seed(cfg.seed + fold)
     d = cfg.data
 
-    train_ds = SlideBagDataset(train_ids, labels, d.feature_dir, d.bag_size, train=True)
+    train_ds = SlideBagDataset(train_ids, labels, d.feature_dir, d.bag_size, train=True,
+                               samples_per_slide=d.samples_per_slide)
     val_ds = SlideBagDataset(val_ids, labels, d.feature_dir, d.bag_size, train=False)
 
     # Preloading removes the IO that worker processes exist to hide, and each
