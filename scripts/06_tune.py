@@ -96,6 +96,11 @@ def main() -> int:
     p.add_argument("--trials", type=int, default=40)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--study", default="runs/tuning/study.db")
+    p.add_argument("--timeout-hours", type=float, default=None,
+                   help="stop launching new trials after this long and write results. "
+                        "Kaggle containers have been killed mid-run without committing "
+                        "output, so a bounded study that exits cleanly beats an "
+                        "open-ended one that vanishes")
     args = p.parse_args()
 
     import optuna
@@ -127,7 +132,8 @@ def main() -> int:
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=20260820),
     )
-    study.optimize(objective, n_trials=args.trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=args.trials, show_progress_bar=False,
+                   timeout=None if args.timeout_hours is None else args.timeout_hours * 3600)
 
     print("\n" + "=" * 70)
     print(f"best CV QWK {study.best_value:.4f}  (baseline, untuned: 0.4205)")

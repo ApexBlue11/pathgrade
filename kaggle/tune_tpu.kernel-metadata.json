@@ -1,0 +1,15 @@
+{
+  "id": "apexblue/pathgrade-tune1",
+  "title": "pathgrade-tune1",
+  "code_file": "tune.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["apexblue/pathgrade-src", "apexblue/pathgrade-token"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
