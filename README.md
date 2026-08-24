@@ -5,7 +5,7 @@ H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Encoder](https://img.shields.io/badge/encoder-H--optimus--0%20(Apache--2.0)-green.svg)](https://huggingface.co/bioptimus/H-optimus-0)
-[![Tests](https://img.shields.io/badge/tests-129%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-135%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -266,6 +266,18 @@ python scripts/04_evaluate_test.py --run-dir runs/asmil-ord-hoptimus0 --unlock
 ```bash
 python scripts/05_predict_slide.py patient_042.svs --run-dir runs/asmil-ord-hoptimus0
 ```
+
+**6. Tune** (optional) — Optuna over the CV folds. Never opens the test set.
+
+```bash
+python scripts/06_tune.py --feature-dir data/features/h-optimus-0     --splits data/splits.json --labels data/tcga_hnsc_labels.csv --trials 40
+```
+
+CPU-only against extracted features, so it costs no accelerator quota — but it
+wants RAM: the feature cache holds the cohort in memory, and below that
+threshold every sample re-reads a compressed HDF5 file each epoch and trials
+take hours. `kaggle/tune_tpu.py` runs the same search on a TPU VM host for its
+224 vCPU and ~405 GB.
 
 ---
 

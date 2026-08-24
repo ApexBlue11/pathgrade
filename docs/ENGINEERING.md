@@ -224,6 +224,58 @@ meaningless confidence score) were real, shipped, and are fixed.
 
 ---
 
+## What was tried against the weak result, and what it taught
+
+**Attempt 1 — regularise harder and penalise uniform attention.** Bag size
+1536→384, weight decay 1e-4→1e-2, dropout 0.25→0.4, attention-entropy penalty
+0.5. Result: CV QWK 0.4205→0.3873, test 0.2930→0.2594. Worse on both.
+
+More useful than the number is *why*. The entropy penalty did not merely fail
+to help, it did nothing at all: normalised attention entropy went 0.9975 →
+**0.9998** with the penalty active — more uniform, not less. Uniform attention
+is the **maximum** of entropy, so the gradient of an entropy penalty vanishes
+exactly at the collapse. There is no downhill direction out of a stationary
+point at any coefficient. That is a property of the objective, not a tuning
+problem, and there is now a test computing both gradients to keep the lever
+from being reached for again.
+
+The second half of that failure was self-inflicted: raising weight decay 100×
+to fight overfitting attacks the very layer that was already being decayed to
+death. The scorer's output layer went from std 0.018 (first run) to 0.008,
+against an initialisation of ~0.036. And with four variables moved at once, the
+regression could not have been attributed even if it had been informative.
+
+The mechanism the evidence actually supports: once the head fits the training
+set from the bag mean, **no gradient defends the attention scorer and weight
+decay is the only force still acting on it**. So `optim.scorer_no_decay`
+exempts it — which, unlike an entropy penalty, has a non-zero gradient at
+uniform.
+
+**Attempt 2 — the search that was never run.** v1 ran 35 Optuna trials; v2
+shipped its first real number on pure defaults, so "the old model was better"
+has never been a like-for-like comparison. `scripts/06_tune.py` searches what
+the diagnostic implicated — `scorer_no_decay`, `lr_mult_scorer`, `bag_size`,
+`samples_per_slide`, decay, dropout, branch drop, `n_branches`, `hidden`, lr,
+batch size, `lambda_qwk` — with `lambda_attn_entropy` deliberately excluded,
+since searching a lever that cannot move only wastes trials.
+
+Two disciplines carried into it. The objective is **mean CV QWK and the locked
+test set is never opened by the tuner** — tuning against the test set is
+exactly how v1's 0.6683 became a selection optimum. And the study is SQLite,
+written trial by trial, because a Kaggle container that dies takes anything
+not already on disk with it.
+
+**A measurement mistake worth recording**, since it is the third instance of
+the same failure mode. Local tuning was estimated at ~14 min/trial from a
+synthetic in-RAM benchmark. The real loop was hours per trial, because
+`_preload_is_worthwhile()` read `/proc/meminfo`, which does not exist on
+Windows, failed closed, and left every sample re-reading and gunzipping an
+HDF5 file on every epoch. Disk, not compute — and the same `/proc/meminfo`
+assumption had already caused one earlier bug here. The probe is now a real
+cross-platform function with a test.
+
+---
+
 ## What's next
 
 - External validation on a second cohort (CPTAC-HNSCC is the natural one) -
