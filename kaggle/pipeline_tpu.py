@@ -102,14 +102,20 @@ TPU_CORES = os.environ.get("PATHGRADE_TPU_CORES", "1")
 # processes each own a chip. 8 processes x 16 decode threads also puts 128 of
 # the 224 vCPU to work instead of 16.
 NPROCS = os.environ.get("PATHGRADE_NPROCS", "8")
-# 4 streams (143 MB/s measured) against a single-device pipeline that consumes
-# ~24 MB/s of slides end to end - already 6x over-provisioned, so raising this
-# buys nothing today and would only be unmeasured risk. It becomes the binding
-# constraint only once encoding is genuinely 8-way parallel; both are env-
-# tunable for that run. Raising --download-workers alone does nothing: the
-# prefetcher's semaphore counts slides on disk, so --prefetch must rise too.
-DOWNLOAD_WORKERS = os.environ.get("PATHGRADE_DOWNLOAD_WORKERS", "4")
-PREFETCH = os.environ.get("PATHGRADE_PREFETCH", "4")
+# MEASURED, and the correction matters: download is the binding constraint, and
+# 4 was starving it. Across chunks c1/c5/c6 per-stream throughput was a steady
+# 30 MB/s, but the AGGREGATE over wall clock was only 14-17 MB/s - less than a
+# single stream. The cause is structural, not bandwidth: the prefetcher's
+# semaphore counts slides on disk, so after the opening burst of 4 a new
+# download cannot start until the consumer finishes a slide and frees a slot.
+# Downloads and encoding therefore barely overlap, which is why the 143 MB/s
+# measured at 4 parallel streams never appeared in the real pipeline.
+#
+# Raising --download-workers alone does nothing; --prefetch is the semaphore and
+# has to rise with it. Scratch is free: 16 slides of c6's unusually large 1.6 GB
+# mean is 26 GB of the 1098 GB on /kaggle/tmp.
+DOWNLOAD_WORKERS = os.environ.get("PATHGRADE_DOWNLOAD_WORKERS", "16")
+PREFETCH = os.environ.get("PATHGRADE_PREFETCH", "16")
 # Wall-clock budget for extraction. Deliberately short by default: the two
 # runs that tried to do the whole cohort in one session were killed outright
 # (86 min, 3 h 45) and lost everything, while a 34-minute run committed fine.
