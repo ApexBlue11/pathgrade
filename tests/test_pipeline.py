@@ -1217,3 +1217,42 @@ def test_scorer_can_be_exempted_from_weight_decay():
     groups = {g["name"]: g for g in build_param_groups(model, cfg)}
     assert groups["scorer"]["weight_decay"] == 0.0, "scorer must be exempt when asked"
     assert "weight_decay" not in groups["head"], "the head must keep the global decay"
+
+
+def test_memory_probe_works_off_linux():
+    """The preload cache silently never engaged on Windows/macOS.
+
+    _preload_is_worthwhile read /proc/meminfo and failed closed, so every
+    sample re-read and gunzipped an HDF5 file every epoch - which looked like
+    a compute problem and was disk.
+    """
+    from pathgrade.data.dataset import available_memory_bytes
+
+    got = available_memory_bytes()
+    assert got is not None, "no platform branch returned a value"
+    assert got > 64 * 1024 * 1024, f"implausibly small free memory: {got}"
+
+
+def test_cache_sizing_does_not_multiply_with_samples_per_slide(tmp_path):
+    """samples repeats a slide N times; the cache must still count it once."""
+    from pathgrade.data.dataset import SlideBagDataset
+
+    rng = np.random.default_rng(0)
+    ids = [f"P{i}" for i in range(4)]
+    labels = {p: 1 for p in ids}
+    for p in ids:
+        write_features(tmp_path / f"{p}.h5",
+                       rng.standard_normal((300, 32)).astype(np.float16),
+                       rng.integers(0, 999, (300, 2)).astype(np.int64),
+                       {"encoder": "h-optimus-0", "embed_dim": 32}, "h5")
+
+    one = SlideBagDataset(ids, labels, tmp_path, bag_size=64, train=True, preload=False)
+    many = SlideBagDataset(ids, labels, tmp_path, bag_size=64, train=True,
+                           samples_per_slide=5, preload=False)
+    assert len(many) == 5 * len(one)
+    assert many._estimated_bytes() == one._estimated_bytes(), \
+        "memory estimate must not scale with samples_per_slide"
+
+    cached = SlideBagDataset(ids, labels, tmp_path, bag_size=64, train=True,
+                             samples_per_slide=5, preload=True)
+    assert len(cached._cache) == 4, "cache holds one entry per slide, not per sample"
