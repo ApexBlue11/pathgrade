@@ -59,7 +59,7 @@ def trail(step: str, detail: str = "") -> None:
 trail("BOOT", f"python {sys.version.split()[0]}")
 
 TRIALS = int(os.environ.get("PATHGRADE_TRIALS", "60"))
-EPOCHS = int(os.environ.get("PATHGRADE_TUNE_EPOCHS", "30"))
+EPOCHS = int(os.environ.get("PATHGRADE_TUNE_EPOCHS", "20"))
 BUDGET_H = float(os.environ.get("PATHGRADE_TUNE_HOURS", "2.5"))
 
 
@@ -117,6 +117,7 @@ cmd = [
     "--trials", str(TRIALS),
     "--epochs", str(EPOCHS),
     "--timeout-hours", str(BUDGET_H),
+    "--workers", os.environ.get("PATHGRADE_TUNE_WORKERS", "16"),
 ]
 trail("STEP", f"{TRIALS} trials, {EPOCHS} epochs each, {BUDGET_H}h budget")
 

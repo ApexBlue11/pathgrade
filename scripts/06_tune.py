@@ -64,8 +64,11 @@ def build_cfg(trial, args):
     cfg.data.labels_csv = args.labels
     cfg.data.splits_path = args.splits
 
-    cfg.data.bag_size = trial.suggest_categorical("bag_size", [256, 384, 512, 768, 1536])
-    cfg.data.samples_per_slide = trial.suggest_int("samples_per_slide", 1, 6)
+    # Bounded so no single trial can eat the whole session. Cost scales with
+    # bag_size * samples_per_slide, and the unbounded space let trial 0 draw
+    # the most expensive corner (1536 x 2) on its very first sample.
+    cfg.data.bag_size = trial.suggest_categorical("bag_size", [256, 384, 512, 768])
+    cfg.data.samples_per_slide = trial.suggest_int("samples_per_slide", 1, 4)
 
     cfg.model.dropout = trial.suggest_float("dropout", 0.1, 0.6)
     cfg.model.branch_drop = trial.suggest_float("branch_drop", 0.0, 0.7)
@@ -78,7 +81,11 @@ def build_cfg(trial, args):
     cfg.optim.lr_mult_scorer = trial.suggest_float("lr_mult_scorer", 0.5, 8.0, log=True)
     cfg.optim.batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
     cfg.optim.epochs = args.epochs
-    cfg.optim.num_workers = 0          # threads fight the CPU training loop
+    # NOT 0. The first attempt hardcoded 0 on the guess that "threads fight the
+    # CPU training loop" and serialised data loading on a 224-vCPU host: one
+    # trial took over 2.5 hours, so a 60-trial study would have needed ~150.
+    # An unmeasured guess, and the fourth of this kind in this project.
+    cfg.optim.num_workers = args.workers
     cfg.optim.amp = False
 
     cfg.loss.lambda_qwk = trial.suggest_float("lambda_qwk", 0.0, 0.6)
@@ -94,7 +101,14 @@ def main() -> int:
     p.add_argument("--labels", required=True)
     p.add_argument("--out", default="runs/tuning")
     p.add_argument("--trials", type=int, default=40)
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--epochs", type=int, default=20,
+                   help="epochs per fold DURING SEARCH. Lower than a final run on "
+                        "purpose - the first real run's folds peaked between epochs "
+                        "1 and 21, so 20 is enough to rank configs. Retrain the "
+                        "winner at full length.")
+    p.add_argument("--workers", type=int, default=8,
+                   help="dataloader workers. Hardcoding 0 made one trial take over "
+                        "2.5 hours on a 224-vCPU host")
     p.add_argument("--study", default="runs/tuning/study.db")
     p.add_argument("--timeout-hours", type=float, default=None,
                    help="stop launching new trials after this long and write results. "
@@ -103,27 +117,56 @@ def main() -> int:
                         "open-ended one that vanishes")
     args = p.parse_args()
 
+    import numpy as np
     import optuna
     import torch
-    from pathgrade.train import run_cv
+    from pathgrade.data.dataset import feature_dim
+    from pathgrade.data.splits import load_splits
+    from pathgrade.train import train_fold
 
     torch.set_num_threads(max(1, (__import__("os").cpu_count() or 4)))
     Path(args.study).parent.mkdir(parents=True, exist_ok=True)
 
     def objective(trial):
+        """Run the folds one at a time so a bad config can be abandoned early.
+
+        Driving the fold loop here rather than calling run_cv is what makes
+        pruning possible: reporting the running mean after each fold lets
+        Optuna kill a clearly-losing config after one or two folds instead of
+        paying for all five. On a budget where a full trial is tens of minutes,
+        that is the difference between a handful of trials and a real search.
+        """
         cfg = build_cfg(trial, args)
-        try:
-            summary = run_cv(cfg)
-        except Exception as e:                      # a bad corner of the space
-            print(f"trial {trial.number} failed: {type(e).__name__}: {e}", flush=True)
-            raise optuna.TrialPruned() from e
-        qwk = float(summary["qwk"]["mean"])
-        # Report attention entropy too: a config that scores well while leaving
-        # attention uniform has produced a mean-pooler, which is worth knowing
-        # even when the metric looks fine.
-        trial.set_user_attr("qwk_std", float(summary["qwk"]["std"]))
-        trial.set_user_attr("per_fold", summary["qwk"]["per_fold"])
-        return qwk
+        splits = load_splits(cfg.data.splits_path)
+        labels = splits.labels
+        dev_ids = sorted({p for f in splits.folds for p in f["train"] + f["val"]})
+        if cfg.model.feature_dim is None:
+            cfg.model.feature_dim = feature_dim(cfg.data.feature_dir, dev_ids)
+        cfg.run_dir.mkdir(parents=True, exist_ok=True)
+
+        device = torch.device("cpu")
+        scores = []
+        for i, fold in enumerate(splits.folds):
+            try:
+                _log, metrics = train_fold(cfg, i, fold["train"], fold["val"],
+                                           labels, device)
+            except Exception as e:                  # a bad corner of the space
+                print(f"trial {trial.number} fold {i} failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                raise optuna.TrialPruned() from e
+
+            scores.append(float(metrics.qwk))
+            running = float(np.mean(scores))
+            trial.report(running, step=i)
+            print(f"  trial {trial.number} fold {i}: qwk {metrics.qwk:.4f} "
+                  f"(running mean {running:.4f})", flush=True)
+            if trial.should_prune():
+                trial.set_user_attr("pruned_after_folds", i + 1)
+                raise optuna.TrialPruned()
+
+        trial.set_user_attr("per_fold", scores)
+        trial.set_user_attr("qwk_std", float(np.std(scores)))
+        return float(np.mean(scores))
 
     study = optuna.create_study(
         direction="maximize",
@@ -131,6 +174,10 @@ def main() -> int:
         storage=f"sqlite:///{args.study}",
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=20260820),
+        # Let each config prove itself on 2 folds before it can be cut, and
+        # give the first few trials a free pass so the median has something
+        # to compare against.
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=4, n_warmup_steps=2),
     )
     study.optimize(objective, n_trials=args.trials, show_progress_bar=False,
                    timeout=None if args.timeout_hours is None else args.timeout_hours * 3600)
