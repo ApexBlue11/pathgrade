@@ -364,6 +364,14 @@ Read plainly, not as a headline:
 - The class split is uneven (G1 56 / G2 265 / G3 114); the confusion matrix
   shows G1 recall (3/9 in test) is the weakest cell, consistent with that
   imbalance rather than a modelling failure specific to G1.
+- **Plain accuracy is not in that table, and the reason matters.** The model
+  scores 0.530 on the locked test set; always predicting G2 scores 0.606,
+  because 40 of the 66 test slides are G2. Accuracy rewards a constant
+  predictor on a cohort this skewed, which is why the table reports QWK and
+  balanced accuracy - measures a constant predictor cannot win. That same
+  always-G2 baseline scores QWK 0.0 and balanced accuracy 0.333, against the
+  model's 0.293 and 0.468. The model is genuinely better than the trivial
+  answer; it is just not better on the metric that flatters it.
 - Training used **3000 patches/slide**, a number chosen to fit a Kaggle
   session rather than tuned - see [`docs/ENGINEERING.md`](docs/ENGINEERING.md)
   for why raising it stayed out of scope this round.

@@ -276,6 +276,46 @@ cross-platform function with a test.
 
 ---
 
+## The weight-decay explanation for the attention collapse is wrong
+
+The diagnostic proposed that attention collapsed to uniform because, once the
+classifier could fit the training set from the bag mean, no gradient defended
+the attention scorer and weight decay was the only force still acting on it.
+It was a tidy story and it is not true.
+
+Both arms of the 2x2 ran 20 epochs on identical seeds, differing only in
+`optim.scorer_no_decay`:
+
+| arm | CV QWK (per-fold) | final attention entropy |
+|---|---|---|
+| baseline | 0.474 / 0.359 / 0.463 / 0.544 | 0.999289 |
+| scorer exempted from decay | 0.474 / 0.359 / 0.463 / 0.544 | 0.999276 |
+
+Identical to four decimals. The runs are not byte-identical - the final loss
+differs around its sixth decimal - so the flag is plumbed through and does
+reach the optimiser. The effect is simply negligible.
+
+It was always going to be. AdamW applies decoupled decay as a shrink of
+(1 - lr * wd) per step. At lr 5e-4 and wd 1e-4 that is 1 - 5e-8, so across a
+whole run of roughly 800 steps the scorer loses about 0.004% of its
+magnitude. The collapse this was meant to explain is a fall in the scorer's
+output std from 0.036 to 0.008 - a 78% shrink, four orders of magnitude
+larger than decay can deliver. The hypothesis could have been killed with a
+calculator before an accelerator was booked, which is the lesson worth
+keeping: check that a proposed cause is of the right order of magnitude
+before spending quota measuring it.
+
+So whatever flattens the scorer arrives through the gradient. That is a
+different and harder problem, and it is still open.
+
+A second bug surfaced alongside this. `scripts/07_ablate.py` read the entropy
+by iterating the value returned by `train_fold`, which is a summary dict, not
+the epoch list - iterating it yields string keys, so the comprehension matched
+nothing and every arm reported `attn_entropy_final: null`. The number the
+experiment existed to produce was silently absent, and the run would have been
+read as "inconclusive" rather than "instrument broken". It now reads
+`log["history"]` and prints a warning when a fold yields no entropy at all.
+
 ## What's next
 
 - External validation on a second cohort (CPTAC-HNSCC is the natural one) -

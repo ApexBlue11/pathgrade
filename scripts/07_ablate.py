@@ -11,6 +11,20 @@ diagnostic had already narrowed it to two specific, testable claims:
    and weight decay was the only force still acting on it. If that is right,
    exempting the scorer (`optim.scorer_no_decay`) should raise attention
    entropy away from 1.0.
+
+   MEASURED 2026-08-29, and this is WRONG. Both arms were run for 20 epochs
+   on identical seeds: attention entropy ended at 0.999289 (baseline) versus
+   0.999276 (scorer exempted), and per-fold val QWK was identical to four
+   decimals. Exempting the scorer changes the final loss in its sixth decimal.
+
+   The arithmetic says it could never have worked. AdamW's decoupled decay
+   shrinks a weight by a factor of (1 - lr*wd) per step; at lr 5e-4 and wd
+   1e-4 that is 1 - 5e-8, so over a whole run of ~800 steps the scorer can
+   lose about 0.004% of its magnitude. The collapse being explained was a
+   drop from std 0.036 to 0.008 - a 78% shrink. Decay is roughly four orders
+   of magnitude too weak to be the cause, so whatever is flattening the
+   scorer is arriving through the gradient, not through the regulariser.
+   Axis 1 of this 2x2 is therefore dead; keep it only as a control.
 2. Training saw ~348 samples per fold and drove training loss to ~0. If that is
    the overfitting, drawing several disjoint sub-bags per slide
    (`data.samples_per_slide`) should help generalisation.
@@ -115,11 +129,21 @@ def main() -> int:
             qwks.append(float(metrics.qwk))
             # attn_entropy_raw is logged every epoch whether or not the penalty
             # is on; the last epoch's value is where the scorer ended up.
-            ent = [e["parts"].get("attn_entropy_raw") for e in log
-                   if isinstance(e, dict) and "parts" in e]
+            #
+            # train_fold returns a summary dict, not the epoch list - iterating
+            # it directly yields string keys, so the old comprehension silently
+            # produced nothing and every arm reported attn_entropy_final: null.
+            # That is the one number this experiment exists to measure, so a
+            # missing value is now loud rather than a null in the output file.
+            ent = [e["parts"]["attn_entropy_raw"] for e in log["history"]
+                   if isinstance(e, dict) and "attn_entropy_raw" in e.get("parts", {})]
             ent = [x for x in ent if x is not None]
             if ent:
                 entropies.append(float(ent[-1]))
+            else:
+                print("  WARNING: no attn_entropy_raw in this fold's history - "
+                      "the entropy column below is not measuring anything.",
+                      flush=True)
             print(f"  fold {i}: qwk {metrics.qwk:.4f}"
                   + (f"  attn_entropy {ent[-1]:.4f}" if ent else ""), flush=True)
 
