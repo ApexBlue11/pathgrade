@@ -87,12 +87,20 @@ members, so the map reflects the full ensemble rather than one arbitrary view.
 > **The checkpoint from the first real training run does not deliver this.**
 > Its attention is *exactly* uniform - the top 1% of patches hold 1.0% of the
 > mass, normalised entropy 1.0000 - so it is mean-pooling and the overlay is
-> flat noise. The design above is sound; the trained weights did not realise
-> it, because the head could already fit the training set from the bag mean and
-> nothing ever pushed the scorer to specialise. Call
-> `attention_is_informative(prediction)` before showing an overlay to anyone -
-> a meaningless heatmap in front of a pathologist is worse than no heatmap.
-> Cause, evidence and fix: [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
+> flat noise. Call `attention_is_informative(prediction)` before showing an
+> overlay to anyone: a meaningless heatmap in front of a pathologist is worse
+> than no heatmap.
+>
+> Measured since, against a **randomly initialised control**, and the honest
+> statement is stronger than "collapsed": across 5 folds x 5 slides the trained
+> attention is *no more peaked than random initialisation* (max/mean 1.128 vs
+> 1.150), so the module never learned rather than having learned and degraded.
+> Separately, the 24 subspaces disagree about which patches matter - pairwise
+> correlation 0.087, top-30 overlap 1.3% against a 1.0% chance rate - so
+> averaging them for display flattens what little structure each one has by
+> 3.8x. That flattening is present at initialisation, so it is architectural.
+> Both have to be fixed, and any fix has to beat the random-init control.
+> Full evidence: [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
 
 Deployment path: **slide to H-optimus-0 embeddings + coords, then
 `GradePredictor.predict`, giving grade + heatmap.** Only the first stage needs a GPU.
@@ -256,6 +264,22 @@ wants RAM: the feature cache holds the cohort in memory, and below that
 threshold every sample re-reads a compressed HDF5 file each epoch and trials
 take hours. `kaggle/tune_tpu.py` runs the same search on a TPU VM host for its
 224 vCPU and ~405 GB.
+
+**7. Audit the attention** — is the overlay an explanation or a decoration?
+
+```bash
+python scripts/08_attention_audit.py --run-dir runs/asmil-ord-hoptimus0     --feature-dir data/features/h-optimus-0
+```
+
+Scores the trained attention against **the same architecture untrained**.
+That control is the whole point: softmax over a few thousand patches is never
+perfectly flat, so peakedness on its own proves nothing, and only beating
+random initialisation shows the module learned. It reports how peaked one
+subspace's map is, whether the 24 subspaces agree on which patches matter,
+and what the ensembled map a viewer actually sees looks like. Run it before
+believing any overlay, including after a change meant to fix one. Reads no
+labels and never touches the test set. (`scripts/07_ablate.py` is the other
+optional step - a controlled 2x2 rather than a broad search.)
 
 ---
 

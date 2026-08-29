@@ -316,6 +316,51 @@ experiment existed to produce was silently absent, and the run would have been
 read as "inconclusive" rather than "instrument broken". It now reads
 `log["history"]` and prints a warning when a fold yields no entropy at all.
 
+## The attention did not collapse. It never learned.
+
+With the decay explanation dead, the next step was to measure the scorer
+directly rather than propose another cause. Five folds x five slides, 25
+measurements, comparing the trained checkpoints against a **randomly
+initialised model of the same architecture**:
+
+| | per-subspace max/mean | cross-subspace correlation | ensembled max/mean |
+|---|---|---|---|
+| trained | 1.128 +/- 0.022 | +0.045 +/- 0.033 | 1.034 +/- 0.009 |
+| random init | 1.150 | +0.010 | 1.037 |
+
+A randomly initialised attention module produces a *slightly more peaked*
+map than the trained one. Whatever training did to the scorer, it did not
+make it more informative than chance. The framing in the earlier diagnosis -
+that attention "collapsed", implying it was once useful - is wrong. It was
+never useful. Pre-softmax score std moves from 0.092 at init to 0.081 after
+training; the module is essentially where it started.
+
+**The subspace ensemble is a second, independent problem.** nnMIL scores
+attention on a 256-d window of the 1536-d embedding and averages across 24
+such windows at inference. That is sound only if different windows agree
+about which patches matter. They do not:
+
+* pairwise correlation between the 24 subspace maps: **0.087**
+* overlap of their top-30 patches: **1.3%**, against a chance rate of 1.0%
+
+The windows are picking near-independent patch sets, so averaging them is
+averaging noise, and it shrinks peak structure by 3.8x - close to the sqrt(24)
+= 4.9x expected from averaging decorrelated maps. Per subspace the map reaches
+max/mean 1.137; ensembled it reaches 1.036. Crucially this flattening is
+present at random initialisation too, so it is architectural, not a training
+outcome.
+
+The two failures compound, and neither fix works alone. Sharpening the
+aggregation cannot help while each subspace is individually random. Making
+the scorer learn cannot help while 24 decorrelated maps are averaged for
+display. Any future attempt has to address both, and must be checked against
+the random-init control above - a change that improves the map but not past
+random initialisation has not achieved anything.
+
+The measurement to keep repeating is that control. It cost one CPU-minute on
+checkpoints that already existed, and it invalidated a hypothesis that had
+already consumed a TPU session.
+
 ## What's next
 
 - External validation on a second cohort (CPTAC-HNSCC is the natural one) -
