@@ -896,6 +896,21 @@ class _FakeOpenSlide:
         self.closed = True
 
 
+def _patch_openslide(monkeypatch, cls):
+    """Swap in a fake OpenSlide, skipping if the optional extra is absent.
+
+    These tests replace OpenSlide wholesale and never touch a real slide, but
+    ``monkeypatch.setattr`` resolves "openslide.OpenSlide" by importing the
+    module, so the import still has to succeed. openslide-python lives in the
+    ``extract`` extra - someone who installed only the base dependencies to
+    serve predictions should get a clean skip here, not four errors. CI
+    installs the extra so these actually run.
+    """
+    pytest.importorskip(
+        "openslide", reason="openslide-python is in the 'extract' extra")
+    monkeypatch.setattr("openslide.OpenSlide", cls)
+
+
 class _StubEncoder:
     """Lightweight stand-in for PatchEncoder - avoids building a real 1B-param
     ViT-g just to test that encode_slide wires its arguments correctly."""
@@ -911,7 +926,7 @@ class _StubEncoder:
 def test_encode_slide_returns_extraction_shaped_output(monkeypatch):
     from pathgrade.preprocessing import single_slide as ss
 
-    monkeypatch.setattr("openslide.OpenSlide", _FakeOpenSlide)
+    _patch_openslide(monkeypatch, _FakeOpenSlide)
     monkeypatch.setattr(ss, "PatchEncoder", _StubEncoder)
     monkeypatch.setattr(ss, "build_grid", lambda *a, **k: _FakeGrid(37))
 
@@ -941,7 +956,7 @@ def test_encode_slide_closes_the_slide_even_on_failure(monkeypatch):
             super().__init__(path)
             opened["handle"] = self
 
-    monkeypatch.setattr("openslide.OpenSlide", TrackedSlide)
+    _patch_openslide(monkeypatch, TrackedSlide)
     monkeypatch.setattr(ss, "PatchEncoder", _StubEncoder)
 
     def explode(*a, **k):
@@ -957,7 +972,7 @@ def test_encode_slide_closes_the_slide_even_on_failure(monkeypatch):
 def test_encode_slide_rejects_a_slide_with_no_tissue(monkeypatch):
     from pathgrade.preprocessing import single_slide as ss
 
-    monkeypatch.setattr("openslide.OpenSlide", _FakeOpenSlide)
+    _patch_openslide(monkeypatch, _FakeOpenSlide)
     monkeypatch.setattr(ss, "PatchEncoder", _StubEncoder)
     monkeypatch.setattr(ss, "build_grid", lambda *a, **k: _FakeGrid(0))
 
@@ -974,7 +989,7 @@ def test_slide_thumbnail_scales_to_the_requested_max_side(monkeypatch):
         def get_thumbnail(self, size):
             return size          # return the requested size for inspection
 
-    monkeypatch.setattr("openslide.OpenSlide", Sized)
+    _patch_openslide(monkeypatch, Sized)
     size = ss.slide_thumbnail("fake.svs", max_px=1000)
     assert size == (1000, 500), "aspect ratio must be preserved when scaling to max_px"
 

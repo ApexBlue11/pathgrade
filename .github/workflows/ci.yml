@@ -27,15 +27,21 @@ jobs:
           cache: pip
 
       - name: Install
-        # CPU wheels only: this suite never needs a GPU, and the CUDA build is
-        # a ~2.5 GB download that would dominate the job. timm is pulled in
-        # explicitly because two tests stub timm.create_model to exercise the
-        # real PatchEncoder against a tiny backbone; openslide is not needed,
-        # since every call into it lives inside a function and is mocked.
+        # CPU wheels first, from the PyTorch CPU index: this suite never needs
+        # a GPU, and letting the extras pull the default CUDA build would add
+        # a ~2.5 GB download plus nvidia-* packages. Installing torch and
+        # torchvision here means the extras below find them already satisfied.
+        #
+        # The `extract` extra is installed, not skipped. Its dependencies are
+        # not merely optional to the tests: two stub timm.create_model to run
+        # the real PatchEncoder against a tiny backbone, and four resolve
+        # "openslide.OpenSlide" through monkeypatch, which imports the module
+        # even though the class is replaced. openslide-bin ships the native
+        # OpenSlide library as a wheel, so no apt install is needed.
         run: |
           python -m pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev]" timm
+          pip install -e ".[dev,extract]" openslide-bin
 
       - name: Checkout is complete
         # Run the packaging guard first and on its own: when a file is missing
@@ -45,4 +51,8 @@ jobs:
         run: pytest tests/test_packaging.py -q
 
       - name: Test suite
-        run: pytest -q
+        # -rs lists skip reasons. Those four openslide tests skip themselves
+        # when the extra is missing, which is right for a base install but
+        # would be a silent hole here - this makes any skip visible in the log
+        # rather than hidden inside a green tick.
+        run: pytest -q -rs
