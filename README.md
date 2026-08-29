@@ -5,16 +5,11 @@ H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Encoder](https://img.shields.io/badge/encoder-H--optimus--0%20(Apache--2.0)-green.svg)](https://huggingface.co/bioptimus/H-optimus-0)
-[![Tests](https://img.shields.io/badge/tests-135%20passing-brightgreen.svg)](tests/)
-
----
-
-
+[![Tests](https://img.shields.io/badge/tests-154%20passing-brightgreen.svg)](tests/)
 
 ---
 
 ## explainable attention map
-
 
 A production caller has one thing: a whole-slide image. Not a pre-extracted
 feature file, not a separate thumbnail. One function call covers all of it -
