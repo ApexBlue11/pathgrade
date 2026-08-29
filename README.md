@@ -9,42 +9,12 @@ H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
 
 ---
 
-## Why this exists
 
-This is a clean-room rebuild of an earlier HNSC grading project that was built on
-**UNI**. That project could not be commercialised, for a reason no amount of
-retraining fixes: the UNI gated access agreement prohibits commercial use of UNI
-*and of its derivatives*, and it expressly defines derivatives to include
-**models trained on outputs of the UNI model**. Every checkpoint trained on UNI
-embeddings inherits the restriction. The weights were also being offered under
-MIT, which was not the original author's to grant.
-
-So the encoder is replaced, the head is retrained from scratch, and nothing in
-this repository derives from a non-commercial model.
-
-### The licence trap this repo is designed to avoid
-
-`src/pathgrade/encoders.py` refuses to load a non-commercially-licensed encoder
-unless you explicitly pass `allow_noncommercial=True`. Two pairs are easy to get
-wrong, and in both the *newer, stronger* model is the restricted one:
-
-| | Commercially usable | Blocked |
-|---|---|---|
-| Bioptimus | **H-optimus-0** (Apache-2.0) | H-optimus-**1** (CC-BY-NC-ND) |
-| Paige | **Virchow v1** (Apache-2.0) | Virchow**2** (CC-BY-NC-ND) |
-
-**Prov-GigaPath deserves special mention.** Hugging Face tags it `apache-2.0`,
-which covers the *code*. Its model card states that any deployed use case,
-commercial or otherwise, is out of scope. For a product it is more restrictive
-than UNI. The HF metadata tag is not diligence.
-
-Full table: `python scripts/01_extract_features.py --help`.
 
 ---
 
-## The product surface: grade + explainable attention map
+## explainable attention map
 
-This is the part that gets commercialised, so it leads.
 
 A production caller has one thing: a whole-slide image. Not a pre-extracted
 feature file, not a separate thumbnail. One function call covers all of it -
