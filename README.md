@@ -1,7 +1,8 @@
 # pathgrade
 
-**Commercially-clean whole-slide tumour grading.** Hierarchical attention MIL over
-H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
+**Whole-slide tumour grading with an explainable attention map.** Attention-based
+multiple-instance learning over H-optimus-0 patch embeddings, with a
+rank-consistent ordinal head.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Encoder](https://img.shields.io/badge/encoder-H--optimus--0%20(Apache--2.0)-green.svg)](https://huggingface.co/bioptimus/H-optimus-0)
@@ -9,10 +10,65 @@ H-optimus-0 patch embeddings, with a rank-consistent ordinal head.
 
 ---
 
-## explainable attention map
+## What this is
 
-A production caller has one thing: a whole-slide image. Not a pre-extracted
-feature file, not a separate thumbnail. One function call covers all of it -
+An undergraduate project on grading head and neck squamous cell carcinoma
+(HNSCC) from whole-slide images.
+
+A whole-slide image is a gigapixel scan carrying a single slide-level label, so
+the model has to work out which regions matter without ever being told which
+ones they are - the multiple-instance learning (MIL) setting. What is here is
+the whole pipeline rather than a notebook: streaming feature extraction straight
+from GDC, an attention MIL model with a rank-consistent ordinal head (530K
+trainable parameters), 5-fold cross-validation against a test set locked and
+fingerprinted before any training, and a one-call inference path that returns a
+grade plus a map of where the model looked.
+
+Built on TCGA-HNSC, a 472-slide / 456 GB public cohort. 435 slides were
+streamed, tiled and encoded, then the head was trained - all on free Kaggle TPU
+quota, which shaped a good deal of the engineering below.
+
+It is a rebuild of an earlier attempt on the same cohort, called **v1**
+throughout. v1 used a different encoder and a simpler aggregator, and a lot of
+what is here is a deliberate departure from it - a different pooling design, a
+proper ordinal loss, real attention weights in place of gradient saliency.
+Those comparisons are kept in the text because the reasoning behind a change is
+more useful than the change itself. Where v1 turned out to be right, it is left
+alone and said so.
+
+**The result.** QWK 0.420 in cross-validation, 0.293 on a locked test set of 66
+slides that was read exactly once. Both figures, their confidence intervals and
+the baselines they should be judged against are in
+[Results, honestly](#results-honestly).
+
+**What it shows.** The score is not the interesting part. The attention map -
+the feature that would make a prediction explainable to a pathologist - was
+measured against a randomly initialised control and turned out to be no more
+informative than an untrained model. So the repository says so, ships a guard
+that refuses to display such a map, and documents how it was caught.
+[`docs/ENGINEERING.md`](docs/ENGINEERING.md) is largely a record of things that
+did not work, each with the measurement that settled it.
+
+### How it is built
+
+- **The test set is locked.** 66 slides, fingerprinted with SHA-256 at split
+  time. `load_splits` refuses to load if that fingerprint changes or if a single
+  test slide appears in any training fold, and `evaluate.py` needs `--unlock`
+  before it will read the test set at all.
+- **154 tests, run on every push.** CI builds from a clean checkout - which is
+  how a packaging bug that made the repository unimportable to anyone who cloned
+  it was found.
+- **Claims carry their evidence.** Where a comment says MEASURED it names the
+  run and the numbers; where something was assumed and turned out to be wrong,
+  it is written down rather than quietly deleted.
+
+---
+
+## What it does: a grade and a map of where it looked
+
+Anything calling this has one thing to hand: a whole-slide image. Not a
+pre-extracted feature file, not a separate thumbnail. One function call covers
+the rest -
 tiling, encoding, prediction, and an attention overlay rendered on a
 thumbnail pulled from that same slide, so it is guaranteed to line up with
 the coordinates the attention map is drawn in:
@@ -45,8 +101,8 @@ directory if it contains no `fold*/checkpoint.pt`.
 
 If features are already extracted - the cohort pipeline below writes them -
 `GradePredictor.predict_file("features/TCGA-BA-4078.h5")` skips straight to
-prediction without re-tiling. `grade_slide` is the thin, deployment-shaped
-wrapper: `pathgrade.preprocessing.single_slide.encode_slide` for tiling one
+prediction without re-tiling. `grade_slide` is the thin wrapper around the
+same pieces: `pathgrade.preprocessing.single_slide.encode_slide` for tiling one
 slide with the exact settings training used, then `GradePredictor.predict`,
 then `render_overlay`.
 
@@ -97,8 +153,9 @@ members, so the map reflects the full ensemble rather than one arbitrary view.
 > Both have to be fixed, and any fix has to beat the random-init control.
 > Full evidence: [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
 
-Deployment path: **slide to H-optimus-0 embeddings + coords, then
-`GradePredictor.predict`, giving grade + heatmap.** Only the first stage needs a GPU.
+The whole path is: **slide to H-optimus-0 embeddings + coordinates, then
+`GradePredictor.predict`, giving a grade and a heatmap.** Only the first stage
+needs a GPU.
 
 ---
 
@@ -128,7 +185,7 @@ weighted pool over full 1536-d  ->  MLP  ->  2 CORN logits  ->  P(y>G1), P(y>G2)
   of the attention scorer using a normalised-sigmoid map, pulling the online
   softmax branch toward it via KL. This targets precisely the "epoch-level F1
   swings" the v1 README complained about. The anchor is discarded at inference —
-  zero deployment cost.
+  it costs nothing at inference.
 - **Subspace ensembling.** Attention is scored on one of 24 overlapping 256-d
   windows, drawn at random during training and *all averaged* at inference. That
   is a 24-way ensemble from a single trained model, replacing v1's three
@@ -242,7 +299,7 @@ python scripts/03_train_cv.py --config configs/hnsc_hoptimus0.yaml
 python scripts/04_evaluate_test.py --run-dir runs/asmil-ord-hoptimus0 --unlock
 ```
 
-**5. Predict** — one slide, end to end. This is the path a deployment takes.
+**5. Predict** — one slide, end to end.
 
 ```bash
 python scripts/05_predict_slide.py patient_042.svs --run-dir runs/asmil-ord-hoptimus0
@@ -332,9 +389,10 @@ that survives scrutiny.
 
 ---
 
-## Status and limitations
+## Results, honestly
 
-**First real result, TCGA-HNSC, 435 slides, one locked test set, one seed:**
+**TCGA-HNSC, 435 slides, one locked test set, one seed.** The test set was
+fingerprinted before training and read once, at the end.
 
 | | QWK | macro-F1 | balanced acc. | adjacent acc. |
 |---|---|---|---|---|
@@ -381,10 +439,13 @@ Also true:
   CPTAC-HNSCC is the obvious second cohort.
 - **TCGA grade labels are noisy** and G1/G4 are rare, which caps achievable QWK
   independent of model quality.
-- **This is not a medical device.** A tumour grading product is regulated: FDA
-  510(k)/De Novo in the US, IVDR Class C in the EU, UKCA in the UK. Budget for it.
-- Licence status was verified August 2026 and can change. Re-verify before any
-  release. Nothing here is legal advice.
+- **This is a research project, not a medical device.** Nothing here is
+  validated for clinical use, and grading software used on patients is
+  regulated (FDA 510(k)/De Novo, EU IVDR Class C, UKCA). It is a study of the
+  method, not a diagnostic tool.
+- The encoder is Apache-2.0 (H-optimus-0), chosen so the trained head carries
+  no non-commercial restriction - see [NOTICE](NOTICE). Licences were checked
+  in August 2026 and can change.
 
 ---
 
