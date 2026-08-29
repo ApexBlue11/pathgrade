@@ -70,6 +70,14 @@ overlay.save("explained.png")
 
 Or as a CLI: `python scripts/05_predict_slide.py patient_042.svs --run-dir runs/asmil-ord-hoptimus0`.
 
+`run_dir` is a completed training run's output directory, written by step 3
+of the pipeline below. No checkpoint ships with this repository - `runs/` is
+untracked because the weights are large, and because the attention map from
+the first real run is not yet usable - measured, and documented under "Why
+this attention map is defensible" below. Train a run first, or point `run_dir`
+at your own; `GradePredictor.from_run` raises `FileNotFoundError` naming the
+directory if it contains no `fold*/checkpoint.pt`.
+
 If features are already extracted - the cohort pipeline below writes them -
 `GradePredictor.predict_file("features/TCGA-BA-4078.h5")` skips straight to
 prediction without re-tiling. `grade_slide` is the thin, deployment-shaped
