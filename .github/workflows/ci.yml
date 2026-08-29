@@ -1,0 +1,48 @@
+# Runs the test suite on a fresh checkout of the repository.
+#
+# The point is the checkout. Everything here already passed locally for months
+# while the repo was, on any clone, unimportable: `.gitignore` carried an
+# unanchored `data/` rule that also excluded src/pathgrade/data/, and the
+# working tree developers ran against still had the files. `actions/checkout`
+# is a clone, so a file missing from git makes this job red immediately -
+# which is the one signal that was absent.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        # CPU wheels only: this suite never needs a GPU, and the CUDA build is
+        # a ~2.5 GB download that would dominate the job. timm is pulled in
+        # explicitly because two tests stub timm.create_model to exercise the
+        # real PatchEncoder against a tiny backbone; openslide is not needed,
+        # since every call into it lives inside a function and is mocked.
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]" timm
+
+      - name: Checkout is complete
+        # Run the packaging guard first and on its own: when a file is missing
+        # from git this fails with a message naming the module and pointing at
+        # `git check-ignore`, instead of an opaque collection error 200 tests
+        # later.
+        run: pytest tests/test_packaging.py -q
+
+      - name: Test suite
+        run: pytest -q
