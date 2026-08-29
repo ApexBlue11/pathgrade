@@ -216,8 +216,8 @@ def _encode_parallel(decode_one, n: int, encoders: list, batch_size: int,
     holds nobody up.
 
     Threads only help if the forward pass releases the GIL. It does: dispatch
-    and the blocking device transfer are both C++. That is measured by
-    ``kaggle/cores_probe.py``, not assumed here.
+    and the blocking device transfer are both C++. That is measured, not
+    assumed here; see ``docs/ENGINEERING.md``.
 
     Each thread writes a disjoint slice of ``out``, so no lock is needed on the
     output. Failures are collected and re-raised on the caller's thread rather

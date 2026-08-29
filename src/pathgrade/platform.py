@@ -90,7 +90,8 @@ ENCODE_PATCHES_PER_SEC = {
 }
 
 # Aggregate across eight devices driven by eight threads in ONE process.
-# MEASURED 2026-08-22 (kaggle/cores_probe.py) and the answer is: it does not
+# MEASURED 2026-08-22 on real hardware - see docs/ENGINEERING.md, "Getting
+# real multi-device throughput did not work" - and the answer is: it does not
 # work. Not "does not scale" - does not work.
 #
 #   devices  threads completed  real aggregate

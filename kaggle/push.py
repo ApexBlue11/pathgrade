@@ -7,7 +7,7 @@ kernels push`` insists on a directory containing exactly one file literally
 named ``kernel-metadata.json``. This assembles that directory instead of
 requiring it to be built by hand each time.
 
-    python kaggle/push.py cores_probe
+    python kaggle/push.py ablate_gpu
     python kaggle/push.py pipeline_tpu --dry-run
 
 Two Windows-specific traps are handled:
@@ -83,7 +83,7 @@ def stage(name: str) -> tuple[Path, dict]:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("name", help="basename of the kernel script, e.g. cores_probe")
+    p.add_argument("name", help="basename of the kernel script, e.g. pipeline_tpu")
     p.add_argument("--dry-run", action="store_true", help="stage but do not push")
     p.add_argument("--as", dest="as_id", default=None,
                    help="publish under a different kernel slug, e.g. pathgrade-smoke. "

@@ -783,7 +783,7 @@ def test_build_encoders_returns_single_replica_off_tpu(monkeypatch):
 def test_build_encoders_refuses_to_thread_across_xla_devices(monkeypatch):
     """XLA multi-device threading is measured-broken; degrade, do not crash.
 
-    cores_probe.py on a real v5e-8: 2 threads fine, 3/4 dead at four devices,
+    measured on a real v5e-8: 2 threads fine, 3/4 dead at four devices,
     7/8 dead at eight, all in SyncLiveTensorsGraph. Shipping that would fail
     every slide of a multi-hour extraction, so build_encoders keeps one replica
     unless explicitly forced.

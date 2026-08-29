@@ -233,7 +233,9 @@ def build_encoders(
     if max_devices <= 1 or primary.type != "xla":
         return encoders
 
-    # MEASURED 2026-08-22 on a Kaggle TPU v5e-8 (kaggle/cores_probe.py):
+    # MEASURED 2026-08-22 on a Kaggle TPU v5e-8; the probe script it came from
+    # has since been removed, but the run and its numbers are recorded in
+    # docs/ENGINEERING.md, "Getting real multi-device throughput did not work":
     # driving several XLA devices from several Python threads in ONE process
     # is not safe. Two threads worked; at four, three of four died, and at
     # eight, seven of eight died, all with
