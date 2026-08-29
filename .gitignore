@@ -1,6 +1,10 @@
-# Data and model artefacts — never commit these
-data/
-runs/
+# Data and model artefacts — never commit these.
+# Leading slashes are load-bearing: an unanchored `data/` matches a directory
+# named `data` at ANY depth, and silently excluded the src/pathgrade/data/
+# source package for the entire life of the repo. Anchor anything whose name
+# could collide with a package directory.
+/data/
+/runs/
 *.h5
 *.svs
 *.ndpi
@@ -17,10 +21,10 @@ extraction_manifest.json
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
-dist/
-.venv/
-venv/
+/build/
+/dist/
+/.venv/
+/venv/
 .pytest_cache/
 
 # Editors / OS
