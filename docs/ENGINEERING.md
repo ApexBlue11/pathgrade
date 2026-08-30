@@ -361,6 +361,57 @@ The measurement to keep repeating is that control. It cost one CPU-minute on
 checkpoints that already existed, and it invalidated a hypothesis that had
 already consumed a TPU session.
 
+## The attention scorer was reading a sixth of each feature vector
+
+`gather_window` takes a raw contiguous slice of the embedding,
+`x[..., offset:end]`, and hands it to **one shared** `nn.Linear(256, hidden)`.
+Window position *j* is feature dimension *(offset + j) mod 1536*, so the same
+weight column serves unrelated features on different steps: dim 0 at one
+offset, dim 64 at the next, dim 128 after that. The only weights that suit
+every offset simultaneously are non-committal ones, which is exactly the
+scorer that was measured - indistinguishable from its own initialisation.
+
+This was a misreading of nnMIL's subspace idea. Standard ABMIL and CLAM score
+attention on a *learned* projection of the whole vector, `Linear(D, 256)`. A
+raw slice is a different operation with a different failure mode.
+
+Tested by setting `window = stride = feature_dim`, which makes
+`build_window_offsets` return a single offset covering all 1536 dims - plain
+full-width gated attention, no code change. Two folds, 15 epochs, bag 512, same
+seeds, judged by `scripts/08_attention_audit.py` against a randomly initialised
+control (20 measurements, 2 folds x 10 slides):
+
+| arm | attention max/mean | random-init control | CV QWK |
+|---|---|---|---|
+| sliced 256-d windows (current design) | 1.144 | 1.143 | 0.432 |
+| full-width 1536-d | **1.535** | 1.136 | 0.401 |
+
+The sliced design does not beat its own untrained control - 1.144 against
+1.143. Full-width does, decisively. On one slide the map a viewer would
+actually receive goes from max/mean 1.043 to 1.708, roughly twenty times
+further from uniform, and with a single window there is no subspace averaging
+left to flatten it.
+
+**Two things this did not do, both worth stating.**
+
+It did not produce a usable heatmap. `attention_is_informative` still returns
+False: the top 1% of patches hold 1.45% of the attention mass against the 2.00%
+the guard requires. Better than 1.04%, still not an explanation.
+
+It did not improve accuracy. CV QWK went 0.432 to 0.401 across two folds at 15
+epochs - within the noise of a two-fold comparison, but certainly not a gain.
+So this fixes the mechanism that made attention unlearnable without yet moving
+the number, and the honest reading is that the flat map and the weak score are
+partly separate problems rather than one problem with one cause.
+
+A method note, because it nearly caused a wrong conclusion. Normalised entropy
+saturates: at 3000 patches a map with max/mean 1.3 still scores 0.9996, so
+entropy alone cannot distinguish a working scorer from a broken one at this bag
+size. The two arms read 0.99911 and 0.99699 - a difference easy to dismiss as
+rounding, while max/mean showed 1.144 against 1.535. Peak ratio against a
+control is the discriminating measurement; entropy is only useful for catching
+the exactly-uniform case.
+
 ## What's next
 
 - External validation on a second cohort (CPTAC-HNSCC is the natural one) -

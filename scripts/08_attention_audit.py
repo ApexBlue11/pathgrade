@@ -61,8 +61,14 @@ def summarise(M):
     import numpy as np
 
     per = float(np.mean([w.max() / w.mean() for w in M]))
-    C = np.corrcoef(M)
-    corr = float(C[~np.eye(len(C), dtype=bool)].mean())
+    if M.shape[0] < 2:
+        # A single window (window == feature_dim) is plain full-width attention:
+        # there is no second subspace to correlate against, and np.corrcoef
+        # returns a 0-d scalar rather than a matrix. Undefined, not zero.
+        corr = float("nan")
+    else:
+        C = np.corrcoef(M)
+        corr = float(C[~np.eye(len(C), dtype=bool)].mean())
     avg = M.mean(axis=0)
     return per, corr, float(avg.max() / avg.mean())
 

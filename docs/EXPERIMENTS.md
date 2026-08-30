@@ -69,8 +69,15 @@ Standard ABMIL and CLAM project the whole vector through a *learned*
   `build_window_offsets` already returns a single offset at that setting.
 * **Predicts:** attention entropy falls below the random-init control. QWK may
   or may not move; entropy is the outcome being tested.
-* **Status:** in progress. The `sliced` control (2 folds, 15 epochs, bag 512)
-  came in at CV QWK 0.4319, attention entropy 0.99911.
+* **Status: tested, and the diagnosis holds.** Two folds, 15 epochs, bag 512,
+  same seeds. Full-width attention scores max/mean **1.535** against a
+  random-init control of 1.136; the sliced design scores 1.144 against its own
+  control of 1.143, i.e. no better than untrained. Written up in
+  [`ENGINEERING.md`](ENGINEERING.md).
+* **But not sufficient.** The guard still refuses the map (top 1% holds 1.45%
+  of mass, 2.00% required), and CV QWK went 0.432 to 0.401 - noise at two
+  folds, but not a gain. Remaining items in this tier are now the live ones,
+  and 2.1 matters more than it did, since the score did not move.
 
 ### 1.2 If subspace sampling is kept, keep features in their own positions
 
