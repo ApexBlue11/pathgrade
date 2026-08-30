@@ -95,7 +95,7 @@ Or as a CLI: `python scripts/05_predict_slide.py patient_042.svs --run-dir runs/
 of the pipeline below. No checkpoint ships with this repository - `runs/` is
 untracked because the weights are large, and because the attention map from
 the first real run is not yet usable - measured, and documented under "Why
-this attention map is defensible" below. Train a run first, or point `run_dir`
+the attention map is" below. Train a run first, or point `run_dir`
 at your own; `GradePredictor.from_run` raises `FileNotFoundError` naming the
 directory if it contains no `fold*/checkpoint.pt`.
 
@@ -119,39 +119,56 @@ own errors**, so do not gate anything on it. Ranking by `ambiguity` and keeping
 the most decisive half of slides raised QWK from 0.293 to 0.472 on the first
 real test set.
 
-### Why this attention map is defensible
+### What the attention map is
 
 v1 displayed **input-gradient saliency**: the norm of `d(score)/d(features)` per
 patch. That answers *"which patches would change the prediction if perturbed"* --
 a sensitivity question, not an attribution one. It is noisy, sign-agnostic, and
 not a quantity the model actually uses.
 
-This returns the model's **real attention weights** -- the coefficients it
+This returns the model's **attention weights** -- the coefficients it
 multiplies each patch by when pooling the bag into a slide representation. A
-patch with attention 0.01 contributed exactly 1% of the slide embedding. No
-gradients, no perturbation, no approximation, and it survives a clinician asking
-"how do you know?".
+patch with attention 0.01 contributed exactly 1% of the slide embedding. It is
+read directly out of the forward pass, with no gradient, perturbation or
+surrogate model in between.
+
+Whether that is *useful* is a separate question from what it is, and is
+measured below rather than asserted.
 
 Weights are averaged over all ACMIL branches and all 24 subspace ensemble
 members, so the map reflects the full ensemble rather than one arbitrary view.
 
-> **The checkpoint from the first real training run does not deliver this.**
-> Its attention is *exactly* uniform - the top 1% of patches hold 1.0% of the
-> mass, normalised entropy 1.0000 - so it is mean-pooling and the overlay is
-> flat noise. Call `attention_is_informative(prediction)` before showing an
-> overlay to anyone: a meaningless heatmap in front of a pathologist is worse
-> than no heatmap.
+> **What the checkpoint from the first real training run actually produces is
+> a uniform map.** The top 1% of patches hold 1.0% of the mass and normalised
+> entropy is 1.0000, so the pooled bag equals the plain mean of the patches and
+> the overlay carries no information. `attention_is_informative(prediction)`
+> returns False for it, and every slide in the locked test set.
 >
-> Measured since, against a **randomly initialised control**, and the honest
-> statement is stronger than "collapsed": across 5 folds x 5 slides the trained
-> attention is *no more peaked than random initialisation* (max/mean 1.128 vs
-> 1.150), so the module never learned rather than having learned and degraded.
-> Separately, the 24 subspaces disagree about which patches matter - pairwise
-> correlation 0.087, top-30 overlap 1.3% against a 1.0% chance rate - so
-> averaging them for display flattens what little structure each one has by
-> 3.8x. That flattening is present at initialisation, so it is architectural.
-> Both have to be fixed, and any fix has to beat the random-init control.
-> Full evidence: [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
+> Measured against a **randomly initialised control**: across 5 folds x 5
+> slides the trained attention is no more peaked than random initialisation
+> (max/mean 1.128 vs 1.150). So the description "collapsed", which implies it
+> was once useful, does not fit what was measured; the module ends where it
+> started.
+>
+> Tracing where the peaks go, on one slide:
+>
+> | | attention max/mean |
+> |---|---|
+> | one branch, one subspace | 1.302 |
+> | averaged over 5 ACMIL branches (measured correlation -0.0005) | 1.152 |
+> | averaged over 24 subspaces (correlation 0.087) | 1.036 |
+> | the map `patch_attention` returns | 1.026 |
+>
+> A single branch on a single subspace is peaked. The averaging that follows is
+> over maps that are close to uncorrelated - the branch diversity penalty
+> (`gamma=0.1`) rewards making them so - and averaging k uncorrelated maps
+> reduces peak structure by roughly sqrt(k). The same averaging applies to the
+> pooled bag embedding, not only to the displayed map, which is consistent with
+> the model scoring near a mean-pooling baseline (CV QWK 0.420 against 0.354
+> for a logistic regression on mean-pooled features).
+>
+> Full evidence and method: [`docs/ENGINEERING.md`](docs/ENGINEERING.md).
+> What is queued to test against it: [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 The whole path is: **slide to H-optimus-0 embeddings + coordinates, then
 `GradePredictor.predict`, giving a grade and a heatmap.** Only the first stage
@@ -215,10 +232,11 @@ Two were reconsidered:
   to nurse the `proj` bottleneck. With no projection layer there is much less to
   balance, so a single AdamW group is used until there is evidence otherwise.
 
-MixUp stays out. v1 called it "biologically unsound for WSI feature space",
-which is a reasonable prior, though feature-space mixing does have supporters in
-recent MIL work. The sub-bag resampling already supplies strong augmentation, so
-there is no need to relitigate it now.
+MixUp was left out, carried over from v1's decision rather than tested here.
+Feature-space mixing is used in recent MIL work, and mixup is reported to help
+under label noise, which this cohort has - so this is an untested exclusion, not
+a finding. It is on the list in
+[`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 **Encoder choice matters more than any of this.** The Frontiers 2026
 practical-guidelines study found aggregator choice is largely secondary to
@@ -405,9 +423,10 @@ Read plainly, not as a headline:
   above, and its 95% CI is wide (a direct consequence of 66 test slides) -
   the honest statement is "not yet at reported human agreement, and not
   precisely enough measured to say by how much."
-- **Adjacent accuracy near 97–99%** means the model is very rarely off by more
+- **Adjacent accuracy near 97-99%** means the model is very rarely off by more
   than one grade even when it misses the exact class - errors are ordinal
-  drift, not gross misclassification. That is the CORN head doing its job.
+  drift rather than gross misclassification. Whether the CORN head causes that
+  has not been tested against a plain softmax head on this cohort.
 - The class split is uneven (G1 56 / G2 265 / G3 114); the confusion matrix
   shows G1 recall (3/9 in test) is the weakest cell, consistent with that
   imbalance rather than a modelling failure specific to G1.
