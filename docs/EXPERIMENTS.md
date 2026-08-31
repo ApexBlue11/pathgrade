@@ -99,6 +99,96 @@ worse rather than better.
 across folds. That would show exploitable patch-level structure and put
 attention back on the table as an accuracy lever.
 
+*Result: not falsified.* 369 dev slides, 5-fold CV, logistic regression,
+paired per fold against the mean:
+
+| pooling | CV QWK | paired delta | folds improved | p |
+|---|---|---|---|---|
+| mean (baseline) | 0.3543 | -- | -- | -- |
+| mean + top-10% by norm | 0.3688 | +0.0142 | 2/5 | 0.71 |
+| top-10% by norm | 0.3246 | -0.0300 | 2/5 | 0.48 |
+| mean + max | 0.3215 | -0.0328 | 1/5 | 0.16 |
+| p90 | 0.3187 | -0.0358 | 2/5 | 0.35 |
+| mean + p90 | 0.3074 | -0.0470 | 1/5 | 0.09 |
+| std | 0.3055 | -0.0490 | 2/5 | 0.23 |
+| max | 0.2895 | -0.0648 | 1/5 | 0.18 |
+| bottom-10% by norm | 0.2735 | -0.0810 | 1/5 | 0.14 |
+
+Every alternative is worse than the mean. The only nominal gain is sign-
+inconsistent - 2 of 5 folds - and nowhere near separable from noise. Adding a
+statistic to the mean generally *hurts*, which is what a small-sample
+overfitting penalty looks like when the extra dimensions carry no signal.
+
+**Limitation, and why this is not yet conclusive.** These rankings are
+label-free: patches are ordered by embedding norm. A real attention module
+ranks by a discriminative criterion it learned. So this rules out patch
+selection by a generic saliency proxy, not patch selection in general.
+
+**Hypothesis A2, closing that gap.** Fit an explicit instance-level classifier
+on patches carrying their slide's label, rank each slide's patches by that
+discriminative score, and pool the top of the ranking - attention constructed
+the most direct way available, and the "a good instance classifier is all you
+need" formulation. Fit on training folds only, inside the same CV.
+
+*Predicts:* if A holds, a learned ranking does not beat the mean either.
+
+*Falsified if:* it does, paired across folds - which would mean the signal is
+there and the deep model simply failed to find it, a very different conclusion
+from the ceiling being elsewhere.
+
+*Result: not falsified.* 369 slides, 128 sampled patches each, 5-fold CV, the
+instance classifier fit on training folds only:
+
+| pooling | CV QWK | paired delta | folds improved | p |
+|---|---|---|---|---|
+| mean | 0.3468 | -- | -- | -- |
+| instance softmax (soft attention) | 0.3474 | **+0.0006** | 2/5 | 0.986 |
+| instance top-25% | 0.2526 | -0.0942 | 1/5 | 0.130 |
+| instance top-10% | 0.2595 | -0.0873 | 2/5 | 0.397 |
+
+A learned, explicitly discriminative ranking does not beat the mean. Weighting
+softly by that ranking lands on the mean's score to within 0.0006. Selecting
+hard on it is substantially worse, and worse the harder the selection.
+
+The mean baseline reads 0.3468 here against 0.3543 in the previous table
+because this run pools 128 sampled patches per slide rather than all ~3000;
+the two are consistent, and every comparison above is paired within its own
+run.
+
+Fold-to-fold spread is worth seeing, because it is the reason single-fold
+impressions were untrustworthy: instance top-10% scored 0.271, 0.083, 0.093,
+0.482, 0.369 across the five folds. Three folds say it is far worse than the
+mean and one says it is far better.
+
+## Conclusion on Hypothesis A, from three independent directions
+
+1. The trained deep model's predictions are **identical** to mean pooling -
+   all 5 folds, 100% of slides, delta exactly 0.0000.
+2. No **label-free** pooling statistic beats the mean; most are clearly worse,
+   and adding one to the mean generally hurts.
+3. No **learned discriminative** ranking beats the mean either. Soft weighting
+   equals it to +0.0006 (p = 0.99); hard selection is worse.
+
+On this cohort, with these features, patch selection has essentially nothing
+to offer grading accuracy. Grade behaves as a diffuse, whole-slide property
+and the mean is close to a sufficient statistic for it.
+
+**What follows for the queue.** Tier 1 is still worth doing, but it is an
+explainability project: it decides whether the overlay means anything, and it
+will not move QWK. Anything aimed at the score has to act somewhere other than
+the pooling - the head and loss (2.3, 2.4), the amount of usable training
+signal (2.1), or the features themselves (3.1). Note the head is already
+contributing: a logistic regression on mean-pooled features scores 0.354 while
+the full model scores 0.420, so +0.066 is coming from the MLP, the CORN
+formulation and the training recipe rather than from attention.
+
+**The honest limit of this conclusion.** The instance classifier is linear,
+trained on labels propagated from slide to patch, over 128 sampled patches per
+slide. A stronger instance model on more patches could in principle find
+structure this one missed. What makes the conclusion solid is not any single
+line above but that three methods with different failure modes agree, one of
+which is the trained network itself.
+
 **Hypothesis B (the confound in the result above).** The full-width arm changed
 two things at once - the scorer stopped being aliased across offsets *and* the
 24-way subspace averaging disappeared, since one window means one offset. The

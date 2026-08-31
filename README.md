@@ -441,12 +441,22 @@ Read plainly, not as a headline:
 - Training used **3000 patches/slide**, a number chosen to fit a Kaggle
   session rather than tuned - see [`docs/ENGINEERING.md`](docs/ENGINEERING.md)
   for why raising it stayed out of scope this round.
-- **The attention collapsed to uniform**, so this model is effectively
-  mean-pooling and the score above is what mean-pooling achieves. A tuned
-  mean-pooled logistic regression gets 0.251 on the same test set, which
-  brackets how much the aggregator is currently contributing. Fixing the
-  collapse is the first thing to try, and is diagnosed in full in
-  `docs/ENGINEERING.md`.
+- **This model is a mean-pooler, exactly.** Replacing its learned attention
+  with a uniform 1/N weighting at inference - same weights, same head, no
+  retraining - reproduces its predictions on 100% of slides across all five
+  folds, for a paired difference of 0.0000. The scores above are what mean
+  pooling with this head achieves; the attention branches, subspace ensemble,
+  EMA anchor and diversity penalty contribute nothing to them.
+- **And patch selection does not appear to be worth much here**, which is a
+  separate finding from the one above. Three approaches were compared against
+  mean pooling under the same 5-fold CV: label-free pooling statistics (max,
+  p90, std, top-decile by embedding norm), a learned instance-level classifier
+  ranking patches discriminatively, and the trained network itself. None beat
+  the mean - the closest, soft weighting by a learned instance score, lands
+  within 0.0006 (p = 0.99), and hard selection is clearly worse. On this
+  cohort grade behaves as a diffuse, whole-slide property. So fixing the
+  attention is worth doing for the overlay, but is not the lever for the
+  score. Full tables in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 - This is **one seed, one split**. Nothing here has been tuned against the
   test set - `evaluate.py` requires `--unlock` precisely so that stays true -
   but a single run is a starting point, not a validated estimate of what this
