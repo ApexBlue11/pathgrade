@@ -412,6 +412,51 @@ rounding, while max/mean showed 1.144 against 1.535. Peak ratio against a
 control is the discriminating measurement; entropy is only useful for catching
 the exactly-uniform case.
 
+## Attention: what fixed it, and why fixing it did not help the score
+
+The full-width result in the previous section changed two things at once - the
+scorer stopped being aliased across offsets, *and* the 24-way subspace
+averaging disappeared, since one window means one offset. A third arm,
+`window=256, stride=1536`, gives a single fixed offset over 256 dims: no
+aliasing, no ensemble, dimensionality unchanged. That splits the effect.
+
+Two folds, 15 epochs, bag 512, identical seeds. Peakedness measured against a
+randomly initialised control, 20 measurements per arm:
+
+| arm | dims | offsets | aliased | ensembled | max/mean | control | over control | CV QWK |
+|---|---|---|---|---|---|---|---|---|
+| sliced-24 (shipped design) | 256 | 24 | yes | yes | 1.144 | 1.143 | **+0.001** | 0.432 |
+| sliced-1 | 256 | 1 | no | no | 1.315 | 1.142 | +0.173 | 0.425 |
+| full-1 | 1536 | 1 | no | no | 1.535 | 1.136 | +0.399 | 0.401 |
+
+The shipped design is the only one that fails to beat its own untrained
+control, by +0.001. Both single-offset variants clear it comfortably. The
+total improvement splits about evenly: +0.171 from removing the aliasing and
+the ensemble at fixed dimensionality, +0.220 from letting the scorer see all
+1536 dims instead of 256.
+
+Separating aliasing from ensembling within that first contrast needs a fourth
+arm with one scorer per offset, which is a code change rather than a config
+one. It has not been run, so "aliasing" and "averaging 24 decorrelated maps"
+remain jointly, not individually, established.
+
+**The part worth sitting with.** QWK moves the *other* way: 0.432, 0.425,
+0.401 as peakedness climbs 1.144, 1.315, 1.535. Perfectly monotone across the
+three arms, though on two folds each and well inside fold noise, so it is a
+pattern rather than a result.
+
+It is the pattern the headroom tests predict. If the mean is close to a
+sufficient statistic for grade on this cohort - and three independent methods
+say it is - then any departure from uniform weighting adds variance without
+adding signal, and should cost a little accuracy. Sharpening the attention is
+doing exactly that.
+
+So the fix works and does not pay. The attention module can be made to learn,
+which matters because the overlay is only honest if it reflects something the
+model found. It should not be expected to raise the score, and on this
+evidence a sharper map may cost a little. Those are two different projects and
+this repository had been treating them as one.
+
 ## What's next
 
 - External validation on a second cohort (CPTAC-HNSCC is the natural one) -

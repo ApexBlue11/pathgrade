@@ -211,6 +211,25 @@ stays near `sliced-24` (~1.14).
 per-offset scorers, which is a code change rather than a config one. Deferred
 until the first two contrasts say whether it is worth it.
 
+*Result.* Both contrasts are real and roughly equal:
+
+| arm | dims | offsets | max/mean | control | over control | CV QWK |
+|---|---|---|---|---|---|---|
+| sliced-24 (shipped) | 256 | 24 | 1.144 | 1.143 | **+0.001** | 0.432 |
+| sliced-1 | 256 | 1 | 1.315 | 1.142 | +0.173 | 0.425 |
+| full-1 | 1536 | 1 | 1.535 | 1.136 | +0.399 | 0.401 |
+
++0.171 from removing aliasing and the ensemble at fixed dimensionality, +0.220
+from full-width. The shipped design is the only arm that does not beat its own
+control. Aliasing and ensembling are jointly established, not separately - the
+per-offset-scorer arm would be needed for that, and given that attention is
+not the accuracy lever it is hard to justify.
+
+QWK declines monotonically as peakedness rises (0.432, 0.425, 0.401), which is
+what Hypothesis A predicts: if the mean is near-sufficient, departing from
+uniform weighting adds variance without signal. Two folds per arm, so a
+pattern rather than a result.
+
 **On statistical power, since the last comparison was underpowered.** Fold-to-
 fold QWK sd is roughly 0.09, so a two-fold arm comparison cannot resolve
 differences below about 0.1 - the 0.432 vs 0.401 gap reported earlier is not
