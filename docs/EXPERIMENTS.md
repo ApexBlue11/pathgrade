@@ -50,6 +50,89 @@ displayed map. That is consistent with the model scoring close to a mean-pooler
 
 ---
 
+## The finding that reorders everything below
+
+The trained model's predictions are **identical** to mean pooling.
+
+Replacing the learned attention with a uniform 1/N weighting at inference -
+same weights, same head, same slides, same chunking - changes nothing:
+
+| model | learned attention | uniform pooling | paired delta | identical predictions |
+|---|---|---|---|---|
+| c8-final, 5 folds, bag 1536 | 0.4205 | 0.4205 | +0.0000 | 100.0% of slides |
+| full-width arm, 2 folds, bag 512 | 0.4012 | 0.3996 | +0.0016 | 95.3% of slides |
+
+The reported CV 0.4205 and locked-test 0.2930 are what mean pooling with this
+head achieves. Five branches, 24 subspaces, the EMA anchor, the KL
+stabilisation and the diversity penalty contribute exactly zero to accuracy.
+
+The second row is the important one. That arm's attention *does* learn - it
+beats its random-init control 1.535 to 1.136 - and it still moves QWK by
+0.0016. So a working attention module and an accurate model are close to
+independent goals on this cohort, and no amount of fixing the attention is
+going to move the score on its own.
+
+This splits the project cleanly in two, and the split is worth keeping in mind
+for everything below:
+
+* **The map** is an explainability problem. Tier 1 addresses it. Fixing it
+  makes the overlay mean something; it will not raise QWK.
+* **The score** is a different problem, and attention is not the lever. Tier 2
+  and Tier 3 address it.
+
+### What is being tested next, and what would falsify it
+
+**Hypothesis A.** Grade is a diffuse, whole-slide property on this cohort, so
+the mean is close to a sufficient statistic and patch selection has little to
+offer any aggregator.
+
+*Test:* linear probes over label-free pooling statistics - mean, max, p90,
+std, and the mean of the top and bottom 10% of patches by embedding norm -
+under the same 5-fold CV, paired per fold.
+
+*Predicts:* if A holds, none of them beats the mean by more than fold noise.
+An earlier partial result is consistent with A: mean scores 0.354 and mean
+concatenated with std scores 0.274, i.e. adding a second statistic made it
+worse rather than better.
+
+*Falsified if:* any statistic beats the mean by a margin that holds up paired
+across folds. That would show exploitable patch-level structure and put
+attention back on the table as an accuracy lever.
+
+**Hypothesis B (the confound in the result above).** The full-width arm changed
+two things at once - the scorer stopped being aliased across offsets *and* the
+24-way subspace averaging disappeared, since one window means one offset. The
+1.144 to 1.535 improvement cannot be attributed to de-aliasing alone.
+
+*Test:* a third arm, `window=256, stride=1536`, which yields a single offset at
+position 0. The scorer sees a fixed 256 dims - no aliasing, and no ensemble
+either. That decomposes the total effect into two contrasts:
+
+| contrast | isolates |
+|---|---|
+| sliced-24 to sliced-1 | aliasing plus ensembling, dimensionality held at 256 |
+| sliced-1 to full-1 | dimensionality 256 to 1536, no aliasing either side |
+
+*Predicts:* if aliasing is the cause, `sliced-1` lands near `full-1` (~1.5) and
+well above its control. If the ensemble averaging was the cause, `sliced-1`
+stays near `sliced-24` (~1.14).
+
+*Note:* fully separating aliasing from ensembling needs a fourth arm with
+per-offset scorers, which is a code change rather than a config one. Deferred
+until the first two contrasts say whether it is worth it.
+
+**On statistical power, since the last comparison was underpowered.** Fold-to-
+fold QWK sd is roughly 0.09, so a two-fold arm comparison cannot resolve
+differences below about 0.1 - the 0.432 vs 0.401 gap reported earlier is not
+separable from noise on its own. Two things follow. Comparisons are paired on
+identical folds and seeds, and per-fold deltas are reported rather than only
+means, since a consistent sign across folds is informative even when the mean
+difference is small. And attention peakedness, not QWK, is the primary outcome
+for Tier 1 - it is measured against a control and has a far larger effect size
+(1.14 vs 1.54) than anything QWK is going to show at this sample size.
+
+---
+
 ## Tier 1 - what the measurements point at directly
 
 ### 1.1 Score attention on the full feature vector
