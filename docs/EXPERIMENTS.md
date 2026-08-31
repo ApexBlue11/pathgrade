@@ -387,16 +387,63 @@ an enabler, not an improvement.
 
 ## Tier 3 - the representation itself
 
-### 3.1 CLS plus mean patch tokens
+### 3.1 CLS plus mean patch tokens - now the top of the queue
 
-Features are currently the CLS token alone, 1536-d. Concatenating the mean of
-the patch tokens gives 3072-d, and `encoders.py` already supports `cls_mean`
-for other encoders in the registry.
+Features are the CLS token alone, 1536-d (`h-optimus-0` is registered with
+`pooling="cls"`). This follows the *comparability* convention used when
+foundation models are benchmarked against each other, not the usage the
+encoder's authors recommend. Bioptimus recommend concatenating the CLS token
+with the mean of the patch tokens for downstream work, and the pathology
+benchmarks that report both - eva, HEST, Patho-Bench, PathoROB - treat CLS as
+the standard for comparison while reporting CLS-plus-mean to quantify what the
+spatial context adds. So the current choice is defensible as a baseline and is
+not what the model card asks for.
 
-* **Cost:** a full re-extraction, the only accelerator-expensive stage.
-* **Judge first:** a linear probe on mean-pooled features already reaches
-  0.354, so the features carry real signal. Test the aggregator fixes before
-  spending quota on new ones.
+**Why not keep every patch token instead?** Because of the arithmetic. At
+224px with a /14 patch size a tile yields 256 tokens of 1536 dims plus the
+CLS. Per tile that is 1.51 MB against 6 KB for CLS alone, a factor of 257.
+Across this cohort:
+
+| representation | per tile | per slide (3000 tiles) | 435 slides |
+|---|---|---|---|
+| CLS only | 6 KB | 18 MB | 7.5 GB |
+| all tokens | 1.51 MB | 4.5 GB | **1.87 TB** |
+
+A bag would also carry 768,000 tokens per slide instead of 3000, which no
+aggregator here would handle. Keeping raw tokens is not done at slide level
+for this reason; the approaches that try to keep more than a mean compress
+first - token clustering into prototypes, vector quantisation, or re-embedding
+the features before aggregation.
+
+**The experiment is cheaper than it looks, and is perfectly paired.** One
+extraction at `cls_mean` yields a 3072-d vector whose first 1536 columns are
+the CLS token and whose last 1536 are the patch-token mean. So a single pass
+supports a three-way comparison - CLS alone, patch mean alone, concatenation -
+on identical slides, identical tiles and identical forward passes, with no
+confound and no extra extraction.
+
+That the CLS half is really the same quantity was checked rather than assumed:
+for timm ViTs with `global_pool='token'` and `fc_norm=Identity`, `backbone(x)`
+and `forward_features(x)[:, 0]` agree to 0.000e+00. Verified on
+vit_small_patch16_224 and vit_base_patch16_224; H-optimus-0 is ViT-g/14 with
+`init_values=1e-5`, so the same check should be repeated at extraction time by
+comparing the CLS slice against the already-stored 1536-d features for any
+slide present in both. If they match, the pipeline is confirmed and the
+comparison is paired; if they do not, that is itself worth knowing before
+anything is concluded.
+
+* **Cost:** re-extraction, and since streaming deletes each slide after
+  encoding, that means re-downloading. Download dominates - roughly 1 GB per
+  slide - so run a subset, not the cohort. 100 to 150 slides is enough for a
+  paired linear probe to separate representations if the difference is real.
+* **Primary outcome:** paired CV QWK of a linear probe over the three
+  representations, on the same slides and folds.
+* **Predicts:** concatenation beats CLS alone. The reported benefits are
+  task-dependent, so a null result is a real possibility and would be worth
+  recording.
+* **Why it is now first:** the aggregator is measured to be a dead end for
+  accuracy on this cohort - three methods agree the mean over patches is close
+  to sufficient - so what reaches the aggregator is the remaining lever.
 
 ### 3.2 A second cohort
 
