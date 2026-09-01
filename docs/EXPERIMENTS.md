@@ -511,22 +511,43 @@ resampling is free here because these are linear probes on cached vectors.
 Twenty repeats of stratified 5-fold, 100 paired estimates per representation,
 locked test set excluded throughout:
 
-| representation | mean QWK | delta vs CLS | 95% CI | p |
-|---|---|---|---|---|
-| CLS only | 0.3055 | -- | -- | -- |
-| patch-token mean | 0.2994 | -0.0062 | [-0.0283, +0.0160] | 0.59 |
-| CLS + mean | 0.3149 | **+0.0093** | **[-0.0056, +0.0243]** | 0.22 |
+Repeated cross-validation reuses the same slides across folds, so the paired
+differences are positively correlated and an ordinary paired t-test
+underestimates their variance. The Nadeau-Bengio corrected resampled t-test
+multiplies the variance by `1/n + n_test/n_train`; for 20x5-fold that is
+`1/100 + 0.25 = 0.26` against the naive `0.01`, so the honest standard error
+is 5.1x wider than an uncorrected test reports.
 
-The pre-registered prediction was that concatenation beats CLS alone. Its
-point estimate is positive and it is not significant, so the prediction is not
-confirmed - but the interval is the useful part. **A benefit larger than about
-+0.024 can be ruled out.** Even that upper bound is roughly a third of what
-100 extra slides buys.
+| representation | mean QWK | delta vs CLS | naive 95% CI | corrected 95% CI | corrected p |
+|---|---|---|---|---|---|
+| CLS only | 0.3055 | -- | -- | -- | -- |
+| patch-token mean | 0.2994 | -0.0062 | [-0.0283, +0.0160] | [-0.1205, +0.1082] | 0.92 |
+| CLS + mean | 0.3149 | +0.0093 | [-0.0056, +0.0243] | **[-0.0679, +0.0865]** | 0.81 |
 
-So the representation is not the lever either. `cls_mean` is plausibly worth a
-point of QWK and is free to adopt for anything extracted from here on, but it
-does not change what this model can do, and completing the cohort at
-`cls_mean` cannot be justified by this result alone.
+An earlier version of this file claimed, from the naive interval, that "a
+benefit larger than about +0.024 can be ruled out". That was wrong - it came
+from a test that does not account for the overlap between training sets. The
+correct bound is roughly +0.087, nearly four times wider, and it excludes very
+little.
+
+**How much data would settle it.** The per-fold standard deviation of the
+paired difference is 0.0763. Because the `n_test/n_train` term does not shrink
+with more repeats, resampling has a floor: at 267 slides the corrected
+standard error cannot go below 0.0382 however many repeats are run, so no
+resampling scheme resolves an effect smaller than about 0.107 QWK. Detecting
+the observed +0.0093 would need the variance reduced roughly 132-fold, which
+means on the order of 35,000 slides. TCGA-HNSC contains 472.
+
+So the question is not open, it is **unanswerable on this cohort**, and by two
+orders of magnitude rather than a little. That is a property of the data, not
+of the method, and no further extraction changes it - which is also why the
+remaining ~115 slides were not worth a third session.
+
+What to do with `cls_mean` is therefore a judgement rather than a measurement.
+Its point estimate is positive, it is what the encoder's authors recommend,
+and it costs nothing extra at extraction time, so it is reasonable to adopt
+for anything extracted from here on. What cannot be said is that it helps this
+model, and nothing measurable here will say so.
 
 **Where that leaves the project.** Three levers have now been measured rather
 than assumed: the aggregator contributes nothing (its predictions are
