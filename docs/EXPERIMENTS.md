@@ -445,6 +445,51 @@ anything is concluded.
   accuracy on this cohort - three methods agree the mean over patches is close
   to sufficient - so what reaches the aggregator is the remaining lever.
 
+*Result: inconclusive, and the reason is sample size rather than the
+representation.* 150 slides extracted at `cls_mean`; 25 of them turned out to
+be in the locked test set and were dropped by name, leaving 125 dev slides.
+
+Both guards passed. The CLS half of the new files reproduces the earlier
+extraction at a lowest per-patch cosine of 0.999023 across all 125 overlapping
+slides, so it is the same quantity. It is not bit-identical - median relative
+difference 1.4e-3, below bf16 unit roundoff of 3.9e-3 - which is what XLA's
+reduced-precision matmul produces on TPU. The first tolerance used here was an
+absolute 1e-4 and flagged all 140 slides as mismatched; that was the guard
+being wrong, not the data, and it now tests cosine rather than bit-equality.
+
+| representation | dims | CV QWK | paired delta | folds improved | p |
+|---|---|---|---|---|---|
+| CLS only (current) | 1536 | 0.2617 | -- | -- | -- |
+| CLS + mean | 3072 | 0.2530 | -0.0087 | 3/5 | 0.906 |
+| patch-token mean | 1536 | 0.1937 | -0.0680 | 2/5 | 0.334 |
+
+The pre-registered prediction was that concatenation beats CLS alone. It did
+not. But this does not support the opposite either, and the regularisation
+sweep is what shows why:
+
+| representation | C=0.003 | C=0.01 | C=0.03 | C=0.1 |
+|---|---|---|---|---|
+| cls | 0.2677 | 0.2617 | 0.2169 | 0.1938 |
+| patch mean | 0.2853 | 0.1937 | 0.2224 | 0.1681 |
+| concat | 0.2288 | 0.2530 | 0.1934 | 0.2025 |
+
+Each representation wins at a different C, and the spread across
+hyperparameters (0.168 to 0.285) exceeds any spread between representations.
+The CLS baseline also falls from 0.354 on 369 dev slides to 0.262 on 125, so
+sample size is the dominant term in this table, not the choice of features.
+Reducing the dimensionality with PCA to match does not rescue it - every
+representation goes to roughly zero QWK, because a 120-component PCA fit on
+~100 training slides discards the discriminative directions along with the
+noise.
+
+**So the prediction is untested, not falsified.** Settling it needs the
+remaining ~285 slides at `cls_mean`, which restores the 369-slide dev set the
+earlier 0.354 baseline was measured on. That is roughly two more extraction
+sessions, chained with `--kernel-source` the way the original cohort was
+built. Until then the honest statement is that no evidence either way has been
+produced, and the current CLS-only features remain the baseline by default
+rather than by demonstration.
+
 ### 3.2 A second cohort
 
 CPTAC-HNSCC. Single-cohort CV overstates how well any of this transfers, and no
