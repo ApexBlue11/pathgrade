@@ -124,6 +124,14 @@ MAX_EXTRACT_HOURS = os.environ.get("PATHGRADE_MAX_EXTRACT_HOURS", "0.85")
 SKIP_TRAIN = os.environ.get("PATHGRADE_SKIP_TRAIN") == "1"
 SLIDE_LIMIT = os.environ.get("PATHGRADE_LIMIT")
 RANDOM_WEIGHTS = os.environ.get("PATHGRADE_RANDOM_WEIGHTS") == "1"
+# Token pooling inside each 224px tile. Unset keeps the registry default
+# ("cls"), which is the convention pathology foundation models are
+# benchmarked under. "cls_mean" concatenates the patch-token mean, which is
+# what Bioptimus recommend for downstream use, and doubles the width to
+# 3072. The first 1536 columns are the CLS vector either way, so a
+# cls_mean run can be compared against existing cls features on the same
+# slides without re-encoding anything.
+POOLING = os.environ.get("PATHGRADE_POOLING")
 
 SRC = find_src()
 if SRC is None:
@@ -331,6 +339,8 @@ extract_argv = [
     "--min-free-gb", "4",
     "--notify-every", "25",
 ]
+if POOLING:
+    extract_argv += ["--pooling", POOLING]
 if SLIDE_LIMIT:
     extract_argv += ["--limit", SLIDE_LIMIT]
 if RANDOM_WEIGHTS:

@@ -22,7 +22,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from ..encoders import DEFAULT_ENCODER, check_licence, describe_registry, PatchEncoder
+from ..encoders import (DEFAULT_ENCODER, PatchEncoder, check_licence,
+                        describe_registry, with_pooling)
 from .tiling import build_grid, read_tile
 
 SCHEMA_VERSION = 1
@@ -169,7 +170,8 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=None, help="process at most N slides")
     args = p.parse_args(argv)
 
-    spec = check_licence(args.encoder, args.allow_noncommercial)
+    spec = with_pooling(check_licence(args.encoder, args.allow_noncommercial),
+                        getattr(args, "pooling", None))
     if not spec.commercial_ok:
         print(
             f"\n!! {spec.name} is {spec.licence}. Features and any model trained on them "

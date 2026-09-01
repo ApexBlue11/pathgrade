@@ -23,7 +23,7 @@ alone is not diligence.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import torch
@@ -407,6 +407,32 @@ class PatchEncoder(nn.Module):
             return np.asarray(tile, dtype=np.uint8)
 
         return to_uint8
+
+
+def with_pooling(spec: EncoderSpec, pooling: Pooling | None) -> EncoderSpec:
+    """Return ``spec`` with a different token-pooling rule, width adjusted.
+
+    ``cls`` keeps only the CLS token; ``cls_mean`` concatenates it with the
+    mean of the patch tokens, so the vector is twice as wide. The width has to
+    move with the rule or the shape guard in ``extract.py`` will reject the
+    output - which is the intended behaviour if these ever disagree.
+
+    The registry pins ``cls`` for H-optimus-0 because that is the convention
+    pathology foundation models are benchmarked under, so it is the setting
+    that makes published numbers comparable. Bioptimus recommend ``cls_mean``
+    for downstream use. Both are legitimate and they answer different
+    questions, so the choice is exposed rather than decided here.
+    """
+    if pooling is None or pooling == spec.pooling:
+        return spec
+    if pooling == "cls_mean":
+        return replace(spec, pooling=pooling, embed_dim=spec.embed_dim * 2)
+    if pooling == "cls":
+        if spec.embed_dim % 2:
+            raise ValueError(
+                f"{spec.name} has odd embed_dim {spec.embed_dim}; cannot halve it")
+        return replace(spec, pooling=pooling, embed_dim=spec.embed_dim // 2)
+    raise ValueError(f"unknown pooling {pooling!r}")
 
 
 def describe_registry() -> str:

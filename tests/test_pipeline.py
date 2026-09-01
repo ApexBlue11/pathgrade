@@ -1271,3 +1271,71 @@ def test_cache_sizing_does_not_multiply_with_samples_per_slide(tmp_path):
     cached = SlideBagDataset(ids, labels, tmp_path, bag_size=64, train=True,
                              samples_per_slide=5, preload=True)
     assert len(cached._cache) == 4, "cache holds one entry per slide, not per sample"
+
+
+# --------------------------------------------------------------------------
+# Token pooling: cls vs cls_mean
+#
+# The registry pins `cls` for H-optimus-0 because that is what pathology
+# foundation models are benchmarked under, while the encoder's authors
+# recommend concatenating the patch-token mean for downstream use. Both are
+# reachable, and the width has to track the choice or a feature directory
+# silently disagrees with the model that reads it.
+# --------------------------------------------------------------------------
+def test_with_pooling_tracks_the_width():
+    from pathgrade.encoders import REGISTRY, with_pooling
+
+    cls = REGISTRY["h-optimus-0"]
+    assert (cls.pooling, cls.embed_dim) == ("cls", 1536)
+
+    both = with_pooling(cls, "cls_mean")
+    assert (both.pooling, both.embed_dim) == ("cls_mean", 3072)
+    assert both.name == cls.name and both.licence == cls.licence
+
+    # and back again, for an encoder registered the other way round
+    assert with_pooling(both, "cls").embed_dim == 1536
+    assert with_pooling(REGISTRY["virchow"], "cls").embed_dim == 1280
+
+
+def test_with_pooling_is_a_no_op_when_unset():
+    """None means 'use whatever the registry says', so callers can pass it through."""
+    from pathgrade.encoders import REGISTRY, with_pooling
+
+    spec = REGISTRY["h-optimus-0"]
+    assert with_pooling(spec, None) is spec
+    assert with_pooling(spec, "cls") is spec
+
+
+def test_cls_mean_is_cls_concatenated_with_the_patch_mean():
+    """The first half of a cls_mean vector must be exactly the cls vector.
+
+    This is what makes the planned comparison paired: one extraction yields
+    both representations on identical tiles, so CLS-only and CLS+mean can be
+    compared without re-encoding anything.
+    """
+    torch = pytest.importorskip("torch")
+    from pathgrade.encoders import REGISTRY, PatchEncoder, with_pooling
+
+    spec = REGISTRY["h-optimus-0"]
+    tokens = torch.randn(2, 1 + 4, spec.embed_dim)
+
+    class _Stub:
+        num_prefix_tokens = 1
+
+        def forward_features(self, x):
+            return tokens
+
+        def __call__(self, x):
+            return tokens[:, 0]
+
+    for pooling, expected in (("cls", 1536), ("cls_mean", 3072)):
+        enc = PatchEncoder.__new__(PatchEncoder)
+        enc.spec = with_pooling(spec, pooling)
+        enc.backbone = _Stub()
+        out = enc._forward_inner(torch.zeros(2, 3, 224, 224))
+        assert out.shape[1] == expected
+
+    enc.spec = with_pooling(spec, "cls_mean")
+    out = enc._forward_inner(torch.zeros(2, 3, 224, 224))
+    assert torch.allclose(out[:, :1536], tokens[:, 0])
+    assert torch.allclose(out[:, 1536:], tokens[:, 1:].mean(dim=1))

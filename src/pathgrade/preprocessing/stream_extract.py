@@ -38,6 +38,7 @@ import numpy as np
 import torch
 
 from ..encoders import (DEFAULT_ENCODER, PatchEncoder, build_encoders, check_licence,
+                        with_pooling,
                         describe_registry, resolve_device)
 from ..progress import ProgressReporter
 from .gdc import SlideRecord, download_slide, free_disk_gb, one_slide_per_patient, query_slides, shard, summarise
@@ -405,6 +406,10 @@ def process_slide(
 
     attrs = {
         "encoder": spec.name,
+        # Which token pooling produced these vectors. Recorded because the
+        # width alone does not identify it and a mismatched feature
+        # directory is otherwise silent until training behaves oddly.
+        "pooling": spec.pooling,
         "random_weights": bool(getattr(args, "random_weights", False)),
         "encoder_licence": spec.licence,
         "commercial_ok": spec.commercial_ok,
@@ -438,7 +443,8 @@ def process_slide(
 
 
 def run(args) -> int:
-    spec = check_licence(args.encoder, args.allow_noncommercial)
+    spec = with_pooling(check_licence(args.encoder, args.allow_noncommercial),
+                        getattr(args, "pooling", None))
 
     records = query_slides(args.project, diagnostic_only=not args.include_frozen)
     if args.one_per_patient:
@@ -591,6 +597,11 @@ def build_parser():
                    help="restrict to patients present in this CSV. Skips slides "
                         "that cannot contribute to training")
     p.add_argument("--encoder", default=DEFAULT_ENCODER)
+    p.add_argument("--pooling", choices=["cls", "cls_mean"], default=None,
+                   help="override the encoder's token pooling. cls_mean concatenates "
+                        "the CLS token with the mean of the patch tokens, doubling the "
+                        "width; it is what Bioptimus recommend for downstream use, while "
+                        "cls is the convention these models are benchmarked under.")
     p.add_argument("--format", choices=["pt", "h5"], default="h5")
     p.add_argument("--device", default="auto", help="auto | cuda | xla | cpu")
 
