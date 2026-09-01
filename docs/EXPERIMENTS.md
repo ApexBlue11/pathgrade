@@ -482,13 +482,60 @@ representation goes to roughly zero QWK, because a 120-component PCA fit on
 ~100 training slides discards the discriminative directions along with the
 noise.
 
-**So the prediction is untested, not falsified.** Settling it needs the
-remaining ~285 slides at `cls_mean`, which restores the 369-slide dev set the
-earlier 0.354 baseline was measured on. That is roughly two more extraction
-sessions, chained with `--kernel-source` the way the original cohort was
-built. Until then the honest statement is that no evidence either way has been
-produced, and the current CLS-only features remain the baseline by default
-rather than by demonstration.
+**Settled at 320 slides, by bounding the effect rather than by more data.**
+
+A chained run took the cohort to 320 slides (`SEEDED 150 slides inherited` ->
+`EXTRACTED 320 slides`), of which 53 were in the locked test set and dropped,
+leaving 267 dev slides.
+
+First, a control that explains the earlier confusion. The CLS baseline read
+0.354 on 369 slides and 0.262 on 125, and it was not obvious how much of that
+was sample size and how much was the new extraction. Holding the folds and C
+fixed:
+
+| | CV QWK |
+|---|---|
+| old extraction, all 369 dev slides | 0.3543 |
+| old extraction, the same 267 slides | 0.2708 |
+| new extraction's CLS half, same 267 slides | 0.2708 |
+
+Identical to four decimals. The whole difference is sample size, and the new
+extraction reproduces the old one for practical purposes as well as at the
+cosine level.
+
+That comparison also shows why more slides was the wrong response to a null
+result. Going from 267 to 369 slides moves QWK by +0.084, while the choice of
+representation moves it by about a hundredth. The way to resolve an effect
+that small on a paired comparison is more resampling, not more data, and
+resampling is free here because these are linear probes on cached vectors.
+Twenty repeats of stratified 5-fold, 100 paired estimates per representation,
+locked test set excluded throughout:
+
+| representation | mean QWK | delta vs CLS | 95% CI | p |
+|---|---|---|---|---|
+| CLS only | 0.3055 | -- | -- | -- |
+| patch-token mean | 0.2994 | -0.0062 | [-0.0283, +0.0160] | 0.59 |
+| CLS + mean | 0.3149 | **+0.0093** | **[-0.0056, +0.0243]** | 0.22 |
+
+The pre-registered prediction was that concatenation beats CLS alone. Its
+point estimate is positive and it is not significant, so the prediction is not
+confirmed - but the interval is the useful part. **A benefit larger than about
++0.024 can be ruled out.** Even that upper bound is roughly a third of what
+100 extra slides buys.
+
+So the representation is not the lever either. `cls_mean` is plausibly worth a
+point of QWK and is free to adopt for anything extracted from here on, but it
+does not change what this model can do, and completing the cohort at
+`cls_mean` cannot be justified by this result alone.
+
+**Where that leaves the project.** Three levers have now been measured rather
+than assumed: the aggregator contributes nothing (its predictions are
+identical to mean pooling, and no patch selection beats the mean), the
+representation is bounded at about +0.024, and sample size is worth +0.084 per
+100 slides in the range we are in. The remaining candidates are the ones that
+act on the labels and the amount of data - noise-robust losses (2.3), mixup
+(2.4), and above all a second cohort (3.2). That is a less satisfying answer
+than an architecture fix, and it is what the measurements support.
 
 ### 3.2 A second cohort
 
