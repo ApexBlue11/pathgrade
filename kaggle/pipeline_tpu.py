@@ -306,15 +306,47 @@ banner("1. EXTRACTION  (GDC -> H-optimus-0 embeddings)")
 # Extraction was always idempotent - it skips slides already in out-dir - but
 # that only helps if the previous output survived to be mounted. This is the
 # missing half of that property.
-seeded = 0
+#
+# The glob is deliberately broad - it will take features from any mounted
+# input - so it has to check what it is taking. Feature files record the token
+# pooling that produced them, and cls and cls_mean differ in width (1536 vs
+# 3072). Seeding one into a run configured for the other would build a feature
+# directory of mixed widths, which fails late and confusingly if at all. Files
+# written before that attribute existed are cls by definition.
+WANT_POOLING = POOLING or "cls"
+
+
+def _pooling_of(path):
+    try:
+        import h5py
+
+        with h5py.File(path, "r") as f:
+            got = f.attrs.get("pooling", "cls")
+        return got.decode() if isinstance(got, bytes) else str(got)
+    except Exception as e:                       # unreadable is not seedable
+        return f"<unreadable: {type(e).__name__}>"
+
+
+seeded = skipped = 0
 for src_h5 in glob.glob("/kaggle/input/**/features/*.h5", recursive=True):
     dest = OUT / os.path.basename(src_h5)
-    if not dest.exists():
-        try:
-            shutil.copy(src_h5, dest)
-            seeded += 1
-        except OSError as e:
-            print(f"  could not seed {os.path.basename(src_h5)}: {e}", flush=True)
+    if dest.exists():
+        continue
+    got = _pooling_of(src_h5)
+    if got != WANT_POOLING:
+        if skipped < 5:
+            print(f"  skipping {os.path.basename(src_h5)}: pooling={got!r}, "
+                  f"this run wants {WANT_POOLING!r}", flush=True)
+        skipped += 1
+        continue
+    try:
+        shutil.copy(src_h5, dest)
+        seeded += 1
+    except OSError as e:
+        print(f"  could not seed {os.path.basename(src_h5)}: {e}", flush=True)
+if skipped:
+    print(f"  seeding skipped {skipped} file(s) with the wrong pooling", flush=True)
+    trail("SEED_SKIPPED", f"{skipped} wrong-pooling files")
 if seeded:
     print(f"seeded {seeded} slides from previous runs", flush=True)
 trail("SEEDED", f"{seeded} slides inherited")
