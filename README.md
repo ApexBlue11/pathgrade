@@ -457,6 +457,17 @@ Read plainly, not as a headline:
   cohort grade behaves as a diffuse, whole-slide property. So fixing the
   attention is worth doing for the overlay, but is not the lever for the
   score. Full tables in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
+- **This cohort cannot resolve small QWK differences, and that bounds how any
+  comparison here should be read.** Paired comparisons on 267 dev slides have
+  a floor: repeated cross-validation reuses the same slides, so the paired
+  differences are correlated, and the Nadeau-Bengio correction adds an
+  `n_test/n_train` variance term that more resampling does not reduce. The
+  corrected standard error cannot fall below ~0.038, so **no comparison here
+  separates a QWK difference below roughly 0.1**. Detecting a one-point
+  representation effect would need on the order of 35,000 slides; TCGA-HNSC
+  has 472. The conclusions in this repository that survive that floor are the
+  ones that are not QWK differences at all - predictions identical on 100% of
+  slides, and attention peakedness against an untrained control.
 - This is **one seed, one split**. Nothing here has been tuned against the
   test set - `evaluate.py` requires `--unlock` precisely so that stays true -
   but a single run is a starting point, not a validated estimate of what this

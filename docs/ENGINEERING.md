@@ -440,12 +440,23 @@ arm with one scorer per offset, which is a code change rather than a config
 one. It has not been run, so "aliasing" and "averaging 24 decorrelated maps"
 remain jointly, not individually, established.
 
-**The part worth sitting with.** QWK moves the *other* way: 0.432, 0.425,
-0.401 as peakedness climbs 1.144, 1.315, 1.535. Perfectly monotone across the
-three arms, though on two folds each and well inside fold noise, so it is a
-pattern rather than a result.
+**A pattern, and a caveat that has since grown teeth.** QWK moves the *other*
+way: 0.432, 0.425, 0.401 as peakedness climbs 1.144, 1.315, 1.535. Monotone
+across the three arms.
 
-It is the pattern the headroom tests predict. If the mean is close to a
+It should not be read as more than an ordering, and the reason is now
+quantified rather than gestured at. A later power analysis put the floor on
+paired QWK comparisons at this cohort size at roughly 0.1 - the Nadeau-Bengio
+correction for repeated cross-validation adds an `n_test/n_train` variance
+term that no amount of resampling reduces. The whole spread here is 0.031,
+about a third of that floor, on two folds per arm. So the ordering is
+suggestive and the magnitudes are not measurable; three points moving
+monotonically is also exactly what one would expect from noise about a third
+of the time.
+
+Taking it seriously at all is a matter of it agreeing with what the headroom
+tests predict, which is a weaker reason than a measurement. If the mean is
+close to a
 sufficient statistic for grade on this cohort - and three independent methods
 say it is - then any departure from uniform weighting adds variance without
 adding signal, and should cost a little accuracy. Sharpening the attention is

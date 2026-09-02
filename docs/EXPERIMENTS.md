@@ -18,13 +18,40 @@ Two bars, both cheap, and a change has to clear the relevant one:
   an attention change that does not move this has not done anything, whatever
   it does to QWK.
 * **The mean-pool baseline.** A logistic regression on mean-pooled features
-  scores **CV QWK 0.354**. The current model scores **0.420**, so the whole
-  aggregator is worth +0.066 today. A change that improves QWK without widening
-  that gap has improved the head, not the pooling.
+  scores **CV QWK 0.354**; the full model scores **0.420**. That +0.066 gap is
+  *not* what the aggregator contributes - the model's predictions are identical
+  to mean pooling, so the gap comes from the MLP head, the CORN formulation and
+  the training recipe. The aggregator itself is worth zero, measured. A change
+  that raises QWK has almost certainly improved the head.
 
 Every number below is 5-fold CV on the development split. The locked test set
 (fingerprint `eeaa1233f18fea05`) stays shut until there is something worth
 spending it on.
+
+### How precisely any of this can be measured
+
+Worth stating once, up front, because it governs how every QWK difference in
+this file should be read.
+
+Paired comparisons here are limited by a floor that more resampling cannot
+lower. Repeated cross-validation reuses the same slides, so the paired
+differences are correlated, and the Nadeau-Bengio correction adds an
+`n_test/n_train` term to the variance that does not shrink with more repeats.
+At 267 dev slides with 5-fold CV, the corrected standard error cannot go below
+about 0.038 however many repeats are run, so **no comparison here resolves a
+QWK difference smaller than roughly 0.1**.
+
+That has two consequences worth holding on to:
+
+* Every QWK difference reported below - the arm comparisons, the pooling
+  statistics, the representation results - is **descriptive**, not
+  inferential. The signs and orderings are worth looking at; the magnitudes
+  are inside the noise.
+* The conclusions that survive are the ones resting on effects far above that
+  floor, and they are not QWK differences at all: predictions **identical** on
+  100% of slides, and attention peakedness of 1.14 against a random-init
+  control of 1.15 versus 1.54 for the repaired scorer. Those are the load-
+  bearing results.
 
 ## Where the current model loses its attention
 
